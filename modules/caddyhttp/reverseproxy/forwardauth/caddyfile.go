@@ -59,13 +59,6 @@ func init() {
 //                 Remote-Email {http.reverse_proxy.header.Remote-Email}
 //             }
 //         }
-//
-//         handle_response {
-//             copy_response_headers {
-//                 exclude Connection Keep-Alive Te Trailers Transfer-Encoding Upgrade
-//             }
-//             copy_response
-//         }
 //     }
 //
 func parseCaddyfile(h httpcaddyfile.Helper) ([]httpcaddyfile.ConfigValue, error) {
@@ -192,66 +185,40 @@ func parseCaddyfile(h httpcaddyfile.Helper) ([]httpcaddyfile.ConfigValue, error)
 		},
 		Routes: []caddyhttp.Route{},
 	}
-	if len(headersToCopy) > 0 {
-		handler := &headers.Handler{
-			Request: &headers.HeaderOps{
-				Set: http.Header{},
-			},
-		}
 
-		for from, to := range headersToCopy {
-			handler.Request.Set[to] = []string{
-				"{http.reverse_proxy.header." + from + "}",
-			}
-		}
-
-		goodResponseHandler.Routes = append(
-			goodResponseHandler.Routes,
-			caddyhttp.Route{
-				HandlersRaw: []json.RawMessage{caddyconfig.JSONModuleObject(
-					handler,
-					"handler",
-					"headers",
-					nil,
-				)},
-			},
-		)
-	}
-	rpHandler.HandleResponse = append(rpHandler.HandleResponse, goodResponseHandler)
-
-	// set up handler for denial responses; when a response
-	// has any other status than 2xx, then we copy the response
-	// back to the client, and terminate handling.
-	denialResponseHandler := caddyhttp.ResponseHandler{
-		Routes: []caddyhttp.Route{
-			{
-				HandlersRaw: []json.RawMessage{caddyconfig.JSONModuleObject(
-					&reverseproxy.CopyResponseHeadersHandler{
-						Exclude: []string{
-							"Connection",
-							"Keep-Alive",
-							"Te",
-							"Trailers",
-							"Transfer-Encoding",
-							"Upgrade",
-						},
-					},
-					"handler",
-					"copy_response_headers",
-					nil,
-				)},
-			},
-			{
-				HandlersRaw: []json.RawMessage{caddyconfig.JSONModuleObject(
-					&reverseproxy.CopyResponseHandler{},
-					"handler",
-					"copy_response",
-					nil,
-				)},
-			},
+	handler := &headers.Handler{
+		Request: &headers.HeaderOps{
+			Set: http.Header{},
 		},
 	}
-	rpHandler.HandleResponse = append(rpHandler.HandleResponse, denialResponseHandler)
+
+	// the list of headers to copy may be empty, but that's okay; we
+	// need at least one handler in the routes for the response handling
+	// logic in reverse_proxy to not skip this entry as empty.
+	for from, to := range headersToCopy {
+		handler.Request.Set[to] = []string{
+			"{http.reverse_proxy.header." + from + "}",
+		}
+	}
+
+	goodResponseHandler.Routes = append(
+		goodResponseHandler.Routes,
+		caddyhttp.Route{
+			HandlersRaw: []json.RawMessage{caddyconfig.JSONModuleObject(
+				handler,
+				"handler",
+				"headers",
+				nil,
+			)},
+		},
+	)
+
+	// note that when a response has any other status than 2xx, then we
+	// use the reverse proxy's default behaviour of copying the response
+	// back to the client, so we don't need to explicitly add a response
+	// handler specifically for that behaviour; we do need the 2xx handler
+	// though, to make handling fall through to handlers deeper in the chain.
+	rpHandler.HandleResponse = append(rpHandler.HandleResponse, goodResponseHandler)
 
 	// the rest of the config is specified by the user
 	// using the reverse_proxy directive syntax
