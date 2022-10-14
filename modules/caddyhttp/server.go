@@ -170,9 +170,10 @@ type Server struct {
 	errorLogger  *zap.Logger
 	ctx          caddy.Context
 
-	server    *http.Server
-	h3server  *http3.Server
-	addresses []caddy.NetworkAddress
+	server      *http.Server
+	h3server    *http3.Server
+	h3listeners []net.PacketConn // TODO: we have to hold these because quic-go won't close listeners it didn't create
+	addresses   []caddy.NetworkAddress
 
 	shutdownAt   time.Time
 	shutdownAtMu *sync.RWMutex
@@ -193,9 +194,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt64(&s.activeRequests, 1)
 		defer atomic.AddInt64(&s.activeRequests, -1)
 
-		err := s.h3server.SetQuicHeaders(w.Header())
-		if err != nil {
-			s.logger.Error("setting HTTP/3 Alt-Svc header", zap.Error(err))
+		if r.ProtoMajor < 3 {
+			err := s.h3server.SetQuicHeaders(w.Header())
+			if err != nil {
+				s.logger.Error("setting HTTP/3 Alt-Svc header", zap.Error(err))
+			}
 		}
 	}
 
@@ -493,8 +496,25 @@ func (s *Server) findLastRouteWithHostMatcher() int {
 // serveHTTP3 creates a QUIC listener, configures an HTTP/3 server if
 // not already done, and then uses that server to serve HTTP/3 over
 // the listener, with Server s as the handler.
-func (s *Server) serveHTTP3(hostport string, tlsCfg *tls.Config) error {
-	h3ln, err := caddy.ListenQUIC(hostport, tlsCfg, &s.activeRequests)
+func (s *Server) serveHTTP3(addr caddy.NetworkAddress, tlsCfg *tls.Config) error {
+	switch addr.Network {
+	case "unix":
+		addr.Network = "unixgram"
+	case "tcp4":
+		addr.Network = "udp4"
+	case "tcp6":
+		addr.Network = "udp6"
+	default:
+		addr.Network = "udp" // TODO: Maybe a better default is to not enable HTTP/3 if we do not know the network?
+	}
+
+	lnAny, err := addr.Listen(s.ctx, 0, net.ListenConfig{})
+	if err != nil {
+		return err
+	}
+	ln := lnAny.(net.PacketConn)
+
+	h3ln, err := caddy.ListenQUIC(ln, tlsCfg, &s.activeRequests)
 	if err != nil {
 		return fmt.Errorf("starting HTTP/3 QUIC listener: %v", err)
 	}
@@ -511,6 +531,8 @@ func (s *Server) serveHTTP3(hostport string, tlsCfg *tls.Config) error {
 			},
 		}
 	}
+
+	s.h3listeners = append(s.h3listeners, lnAny.(net.PacketConn))
 
 	//nolint:errcheck
 	go s.h3server.ServeListener(h3ln)
@@ -615,21 +637,18 @@ func (s *Server) shouldLogRequest(r *http.Request) bool {
 		// logging is disabled
 		return false
 	}
+	if _, ok := s.Logs.LoggerNames[r.Host]; ok {
+		// this host is mapped to a particular logger name
+		return true
+	}
 	for _, dh := range s.Logs.SkipHosts {
 		// logging for this particular host is disabled
 		if certmagic.MatchWildcard(r.Host, dh) {
 			return false
 		}
 	}
-	if _, ok := s.Logs.LoggerNames[r.Host]; ok {
-		// this host is mapped to a particular logger name
-		return true
-	}
-	if s.Logs.SkipUnmappedHosts {
-		// this host is not mapped and thus must not be logged
-		return false
-	}
-	return true
+	// if configured, this host is not mapped and thus must not be logged
+	return !s.Logs.SkipUnmappedHosts
 }
 
 // protocol returns true if the protocol proto is configured/enabled.

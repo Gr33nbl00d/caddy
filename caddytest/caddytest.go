@@ -214,7 +214,7 @@ func (tc *Tester) ensureConfigRunning(rawConfig string, configType string) error
 		return actual
 	}
 
-	for retries := 4; retries > 0; retries-- {
+	for retries := 10; retries > 0; retries-- {
 		if reflect.DeepEqual(expected, fetchConfig(client)) {
 			return nil
 		}
@@ -237,13 +237,13 @@ func validateTestPrerequisites() error {
 
 	if isCaddyAdminRunning() != nil {
 		// start inprocess caddy server
-		os.Args = []string{"caddy", "run"}
+		os.Args = []string{"caddy", "run", "--config", "./test.init.config", "--adapter", "caddyfile"}
 		go func() {
 			caddycmd.Main()
 		}()
 
 		// wait for caddy to start serving the initial config
-		for retries := 4; retries > 0 && isCaddyAdminRunning() != nil; retries-- {
+		for retries := 10; retries > 0 && isCaddyAdminRunning() != nil; retries-- {
 			time.Sleep(10 * time.Millisecond)
 		}
 	}
