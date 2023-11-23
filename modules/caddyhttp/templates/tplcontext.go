@@ -188,6 +188,7 @@ func (c TemplateContext) funcHTTPInclude(uri string) (string, error) {
 		return "", err
 	}
 	virtReq.Host = c.Req.Host
+	virtReq.RemoteAddr = "127.0.0.1:10000" // https://github.com/caddyserver/caddy/issues/5835
 	virtReq.Header = c.Req.Header.Clone()
 	virtReq.Header.Set("Accept-Encoding", "identity") // https://github.com/caddyserver/caddy/issues/4352
 	virtReq.Trailer = c.Req.Trailer.Clone()
@@ -264,13 +265,25 @@ func (c TemplateContext) Cookie(name string) string {
 	return ""
 }
 
-// RemoteIP gets the IP address of the client making the request.
+// RemoteIP gets the IP address of the connection's remote IP.
 func (c TemplateContext) RemoteIP() string {
 	ip, _, err := net.SplitHostPort(c.Req.RemoteAddr)
 	if err != nil {
 		return c.Req.RemoteAddr
 	}
 	return ip
+}
+
+// ClientIP gets the IP address of the real client making the request
+// if the request is trusted (see trusted_proxies), otherwise returns
+// the connection's remote IP.
+func (c TemplateContext) ClientIP() string {
+	address := caddyhttp.GetVar(c.Req.Context(), caddyhttp.ClientIPVarKey).(string)
+	clientIP, _, err := net.SplitHostPort(address)
+	if err != nil {
+		clientIP = address // no port
+	}
+	return clientIP
 }
 
 // Host returns the hostname portion of the Host header
@@ -431,6 +444,14 @@ func (c TemplateContext) funcFileStat(filename string) (fs.FileInfo, error) {
 // funcHTTPError returns a structured HTTP handler error. EXPERIMENTAL; SUBJECT TO CHANGE.
 // Example usage: `{{if not (fileExists $includeFile)}}{{httpError 404}}{{end}}`
 func (c TemplateContext) funcHTTPError(statusCode int) (bool, error) {
+	// Delete some headers that may have been set by the underlying
+	// handler (such as file_server) which may break the error response.
+	c.RespHeader.Header.Del("Content-Length")
+	c.RespHeader.Header.Del("Content-Type")
+	c.RespHeader.Header.Del("Etag")
+	c.RespHeader.Header.Del("Last-Modified")
+	c.RespHeader.Header.Del("Accept-Ranges")
+
 	return false, caddyhttp.Error(statusCode, nil)
 }
 
