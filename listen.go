@@ -18,12 +18,14 @@ package caddy
 
 import (
 	"context"
+	"fmt"
+	"go.uber.org/zap"
 	"net"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
-
-	"go.uber.org/zap"
+	"unsafe"
 )
 
 func reuseUnixSocket(network, addr string) (any, error) {
@@ -56,7 +58,7 @@ func listenReusable(ctx context.Context, lnKey string, network, address string, 
 		if err != nil {
 			return nil, err
 		}
-		return &fakeCloseListener{sharedListener: sharedLn.(*sharedListener), keepAlivePeriod: config.KeepAlive}, nil
+		return &fakeCloseListener{sharedListener: sharedLn.(*sharedListener), keepAlivePeriod: config.KeepAlive, keepAliveTime: config.KeepAlive}, nil
 	}
 }
 
@@ -72,9 +74,10 @@ type fakeCloseListener struct {
 	closed          int32 // accessed atomically; belongs to this struct only
 	*sharedListener       // embedded, so we also become a net.Listener
 	keepAlivePeriod time.Duration
+	keepAliveTime   time.Duration
 }
 
-type canSetKeepAlive interface {
+type tcpConnection interface {
 	SetKeepAlivePeriod(d time.Duration) error
 	SetKeepAlive(bool) error
 }
@@ -90,9 +93,10 @@ func (fcl *fakeCloseListener) Accept() (net.Conn, error) {
 	if err == nil {
 		// if 0, do nothing, Go's default is already set
 		// and if the connection allows setting KeepAlive, set it
-		if tconn, ok := conn.(canSetKeepAlive); ok && fcl.keepAlivePeriod != 0 {
+		if tconn, ok := conn.(tcpConnection); ok && fcl.keepAlivePeriod != 0 {
 			if fcl.keepAlivePeriod > 0 {
-				err = tconn.SetKeepAlivePeriod(fcl.keepAlivePeriod)
+				err = setKeepAliveWorkarround(conn, fcl)
+				//err = tconn.SetKeepAlivePeriod(fcl.keepAlivePeriod)
 			} else { // negative
 				err = tconn.SetKeepAlive(false)
 			}
@@ -123,6 +127,37 @@ func (fcl *fakeCloseListener) Accept() (net.Conn, error) {
 	}
 
 	return nil, err
+}
+
+func setKeepAliveWorkarround(conn net.Conn, fcl *fakeCloseListener) error {
+	rawConn, err := conn.(*net.TCPConn).SyscallConn()
+	if err != nil {
+		return err
+	}
+
+	keepaliveParams := syscall.TCPKeepalive{
+		OnOff:    1,
+		Time:     120000,
+		Interval: 15000,
+	}
+	ret := uint32(0)
+	err = rawConn.Control(func(fd uintptr) {
+		err := syscall.WSAIoctl(
+			syscall.Handle(fd),
+			syscall.SIO_KEEPALIVE_VALS,
+			(*byte)(unsafe.Pointer(&keepaliveParams)),
+			uint32(unsafe.Sizeof(keepaliveParams)),
+			nil,
+			0,
+			&ret,
+			nil,
+			0,
+		)
+		if err != nil {
+			fmt.Println("WSAIoctl error:", err)
+		}
+	})
+	return err
 }
 
 // Close stops accepting new connections without closing the
