@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
@@ -38,6 +39,7 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	"github.com/caddyserver/caddy/v2/internal/filesystems"
 	"github.com/caddyserver/caddy/v2/notify"
 )
 
@@ -83,6 +85,9 @@ type Config struct {
 	storage certmagic.Storage
 
 	cancelFunc context.CancelFunc
+
+	// filesystems is a dict of filesystems that will later be loaded from and added to.
+	filesystems FileSystems
 }
 
 // App is a thing that Caddy runs.
@@ -445,6 +450,9 @@ func run(newCfg *Config, start bool) (Context, error) {
 			return ctx, fmt.Errorf("starting caddy administration endpoint: %v", err)
 		}
 	}
+
+	// create the new filesystem map
+	newCfg.filesystems = &filesystems.FilesystemMap{}
 
 	// prepare the new config for use
 	newCfg.apps = make(map[string]App)
@@ -828,7 +836,7 @@ func InstanceID() (uuid.UUID, error) {
 	appDataDir := AppDataDir()
 	uuidFilePath := filepath.Join(appDataDir, "instance.uuid")
 	uuidFileBytes, err := os.ReadFile(uuidFilePath)
-	if os.IsNotExist(err) {
+	if errors.Is(err, fs.ErrNotExist) {
 		uuid, err := uuid.NewRandom()
 		if err != nil {
 			return uuid, err
