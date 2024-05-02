@@ -68,6 +68,9 @@ func init() {
 // `{http.request.orig_uri.query}` | The request's original query string (without `?`)
 // `{http.request.port}` | The port part of the request's Host header
 // `{http.request.proto}` | The protocol of the request
+// `{http.request.local.host}` | The host (IP) part of the local address the connection arrived on
+// `{http.request.local.port}` | The port part of the local address the connection arrived on
+// `{http.request.local}` | The local address the connection arrived on
 // `{http.request.remote.host}` | The host (IP) part of the remote client's address
 // `{http.request.remote.port}` | The port part of the remote client's address
 // `{http.request.remote}` | The address of the remote client
@@ -326,9 +329,10 @@ func (app *App) Provision(ctx caddy.Context) error {
 
 // Validate ensures the app's configuration is valid.
 func (app *App) Validate() error {
-	// each server must use distinct listener addresses
 	lnAddrs := make(map[string]string)
+
 	for srvName, srv := range app.Servers {
+		// each server must use distinct listener addresses
 		for _, addr := range srv.Listen {
 			listenAddr, err := caddy.ParseNetworkAddress(addr)
 			if err != nil {
@@ -342,6 +346,15 @@ func (app *App) Validate() error {
 					return fmt.Errorf("server %s: listener address repeated: %s (already claimed by server '%s')", srvName, addr, sn)
 				}
 				lnAddrs[addr] = srvName
+			}
+		}
+
+		// logger names must not have ports
+		if srv.Logs != nil {
+			for host := range srv.Logs.LoggerNames {
+				if _, _, err := net.SplitHostPort(host); err == nil {
+					return fmt.Errorf("server %s: logger name must not have a port: %s", srvName, host)
+				}
 			}
 		}
 	}
@@ -523,7 +536,7 @@ func (app *App) Stop() error {
 	ctx := context.Background()
 
 	// see if any listeners in our config will be closing or if they are continuing
-	// hrough a reload; because if any are closing, we will enforce shutdown delay
+	// through a reload; because if any are closing, we will enforce shutdown delay
 	var delay bool
 	scheduledTime := time.Now().Add(time.Duration(app.ShutdownDelay))
 	if app.ShutdownDelay > 0 {
@@ -640,6 +653,15 @@ func (app *App) Stop() error {
 	// may deplete resources)
 	if caddy.Exiting() {
 		finishedShutdown.Wait()
+	}
+
+	// run stop callbacks now that the server shutdowns are complete
+	for name, s := range app.Servers {
+		for _, stopHook := range s.onStopFuncs {
+			if err := stopHook(ctx); err != nil {
+				app.logger.Error("server stop hook", zap.String("server", name), zap.Error(err))
+			}
+		}
 	}
 
 	return nil

@@ -1,4 +1,6 @@
 {
+	debug
+
 	log access-console {
 		include http.log.access.foo
 		output file access-localhost.log
@@ -27,6 +29,7 @@ http://localhost:8881 {
 				"encoder": {
 					"format": "console"
 				},
+				"level": "DEBUG",
 				"include": [
 					"http.log.access.foo"
 				]
@@ -39,11 +42,13 @@ http://localhost:8881 {
 				"encoder": {
 					"format": "json"
 				},
+				"level": "DEBUG",
 				"include": [
 					"http.log.access.foo"
 				]
 			},
 			"default": {
+				"level": "DEBUG",
 				"exclude": [
 					"http.log.access.foo"
 				]
@@ -76,7 +81,9 @@ http://localhost:8881 {
 					},
 					"logs": {
 						"logger_names": {
-							"localhost": "foo"
+							"localhost": [
+								"foo"
+							]
 						}
 					}
 				}

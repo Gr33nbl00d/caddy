@@ -18,7 +18,7 @@ import (
 	"strconv"
 
 	"github.com/caddyserver/certmagic"
-	"github.com/mholt/acmez/acme"
+	"github.com/mholt/acmez/v2/acme"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig"
@@ -54,6 +54,7 @@ func init() {
 	RegisterGlobalOption("auto_https", parseOptAutoHTTPS)
 	RegisterGlobalOption("servers", parseServerOptions)
 	RegisterGlobalOption("ocsp_stapling", parseOCSPStaplingOptions)
+	RegisterGlobalOption("cert_lifetime", parseOptDuration)
 	RegisterGlobalOption("log", parseLogOptions)
 	RegisterGlobalOption("preferred_chains", parseOptPreferredChains)
 	RegisterGlobalOption("persist_config", parseOptPersistConfig)
@@ -107,7 +108,7 @@ func parseOptOrder(d *caddyfile.Dispenser, _ any) (any, error) {
 	if !d.Next() {
 		return nil, d.ArgErr()
 	}
-	pos := d.Val()
+	pos := Positional(d.Val())
 
 	newOrder := directiveOrder
 
@@ -121,22 +122,22 @@ func parseOptOrder(d *caddyfile.Dispenser, _ any) (any, error) {
 
 	// act on the positional
 	switch pos {
-	case "first":
+	case First:
 		newOrder = append([]string{dirName}, newOrder...)
 		if d.NextArg() {
 			return nil, d.ArgErr()
 		}
 		directiveOrder = newOrder
 		return newOrder, nil
-	case "last":
+	case Last:
 		newOrder = append(newOrder, dirName)
 		if d.NextArg() {
 			return nil, d.ArgErr()
 		}
 		directiveOrder = newOrder
 		return newOrder, nil
-	case "before":
-	case "after":
+	case Before:
+	case After:
 	default:
 		return nil, d.Errf("unknown positional '%s'", pos)
 	}
@@ -153,9 +154,9 @@ func parseOptOrder(d *caddyfile.Dispenser, _ any) (any, error) {
 	// insert directive into proper position
 	for i, d := range newOrder {
 		if d == otherDir {
-			if pos == "before" {
+			if pos == Before {
 				newOrder = append(newOrder[:i], append([]string{dirName}, newOrder[i:]...)...)
-			} else if pos == "after" {
+			} else if pos == After {
 				newOrder = append(newOrder[:i+1], append([]string{dirName}, newOrder[i+1:]...)...)
 			}
 			break
@@ -212,9 +213,9 @@ func parseOptACMEDNS(d *caddyfile.Dispenser, _ any) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	prov, ok := unm.(certmagic.ACMEDNSProvider)
+	prov, ok := unm.(certmagic.DNSProvider)
 	if !ok {
-		return nil, d.Errf("module %s (%T) is not a certmagic.ACMEDNSProvider", modID, unm)
+		return nil, d.Errf("module %s (%T) is not a certmagic.DNSProvider", modID, unm)
 	}
 	return prov, nil
 }
@@ -345,8 +346,33 @@ func parseOptOnDemand(d *caddyfile.Dispenser, _ any) (any, error) {
 			if ond == nil {
 				ond = new(caddytls.OnDemandConfig)
 			}
+			if ond.PermissionRaw != nil {
+				return nil, d.Err("on-demand TLS permission module (or 'ask') already specified")
+			}
 			perm := caddytls.PermissionByHTTP{Endpoint: d.Val()}
 			ond.PermissionRaw = caddyconfig.JSONModuleObject(perm, "module", "http", nil)
+
+		case "permission":
+			if !d.NextArg() {
+				return nil, d.ArgErr()
+			}
+			if ond == nil {
+				ond = new(caddytls.OnDemandConfig)
+			}
+			if ond.PermissionRaw != nil {
+				return nil, d.Err("on-demand TLS permission module (or 'ask') already specified")
+			}
+			modName := d.Val()
+			modID := "tls.permission." + modName
+			unm, err := caddyfile.UnmarshalModule(d, modID)
+			if err != nil {
+				return nil, err
+			}
+			perm, ok := unm.(caddytls.OnDemandPermission)
+			if !ok {
+				return nil, d.Errf("module %s (%T) is not an on-demand TLS permission module", modID, unm)
+			}
+			ond.PermissionRaw = caddyconfig.JSONModuleObject(perm, "module", modName, nil)
 
 		case "interval":
 			if !d.NextArg() {

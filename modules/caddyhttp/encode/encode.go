@@ -20,11 +20,9 @@
 package encode
 
 import (
-	"bufio"
 	"fmt"
 	"io"
 	"math"
-	"net"
 	"net/http"
 	"sort"
 	"strconv"
@@ -84,17 +82,43 @@ func (enc *Encode) Provision(ctx caddy.Context) error {
 
 	if enc.Matcher == nil {
 		// common text-based content types
+		// list based on https://developers.cloudflare.com/speed/optimization/content/brotli/content-compression/#compression-between-cloudflare-and-website-visitors
 		enc.Matcher = &caddyhttp.ResponseMatcher{
 			Headers: http.Header{
 				"Content-Type": []string{
-					"text/*",
-					"application/json*",
-					"application/javascript*",
-					"application/xhtml+xml*",
 					"application/atom+xml*",
+					"application/eot*",
+					"application/font*",
+					"application/geo+json*",
+					"application/graphql+json*",
+					"application/javascript*",
+					"application/json*",
+					"application/ld+json*",
+					"application/manifest+json*",
+					"application/opentype*",
+					"application/otf*",
 					"application/rss+xml*",
+					"application/truetype*",
+					"application/ttf*",
+					"application/vnd.api+json*",
+					"application/vnd.ms-fontobject*",
 					"application/wasm*",
+					"application/x-httpd-cgi*",
+					"application/x-javascript*",
+					"application/x-opentype*",
+					"application/x-otf*",
+					"application/x-perl*",
+					"application/x-protobuf*",
+					"application/x-ttf*",
+					"application/xhtml+xml*",
+					"application/xml*",
+					"font/*",
 					"image/svg+xml*",
+					"image/vnd.microsoft.icon*",
+					"image/x-icon*",
+					"multipart/bag*",
+					"multipart/mixed*",
+					"text/*",
 				},
 			},
 		}
@@ -132,6 +156,21 @@ func (enc *Encode) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 			}
 			w = enc.openResponseWriter(encName, w)
 			defer w.(*responseWriter).Close()
+
+			// to comply with RFC 9110 section 8.8.3(.3), we modify the Etag when encoding
+			// by appending a hyphen and the encoder name; the problem is, the client will
+			// send back that Etag in a If-None-Match header, but upstream handlers that set
+			// the Etag in the first place don't know that we appended to their Etag! so here
+			// we have to strip our addition so the upstream handlers can still honor client
+			// caches without knowing about our changes...
+			if etag := r.Header.Get("If-None-Match"); etag != "" && !strings.HasPrefix(etag, "W/") {
+				ourSuffix := "-" + encName + `"`
+				if strings.HasSuffix(etag, ourSuffix) {
+					etag = strings.TrimSuffix(etag, ourSuffix) + `"`
+					r.Header.Set("If-None-Match", etag)
+				}
+			}
+
 			break
 		}
 	}
@@ -195,6 +234,20 @@ type responseWriter struct {
 // to actually write the header.
 func (rw *responseWriter) WriteHeader(status int) {
 	rw.statusCode = status
+
+	// See #5849 and RFC 9110 section 15.4.5 (https://www.rfc-editor.org/rfc/rfc9110.html#section-15.4.5) - 304
+	// Not Modified must have certain headers set as if it was a 200 response, and according to the issue
+	// we would miss the Vary header in this case when compression was also enabled; note that we set this
+	// header in the responseWriter.init() method but that is only called if we are writing a response body
+	if status == http.StatusNotModified && !hasVaryValue(rw.Header(), "Accept-Encoding") {
+		rw.Header().Add("Vary", "Accept-Encoding")
+	}
+
+	// write status immediately when status code is informational
+	// see: https://caddy.community/t/disappear-103-early-hints-response-with-encode-enable-caddy-v2-7-6/23081/5
+	if 100 <= status && status <= 199 {
+		rw.ResponseWriter.WriteHeader(status)
+	}
 }
 
 // Match determines, if encoding should be done based on the ResponseMatcher.
@@ -202,31 +255,18 @@ func (enc *Encode) Match(rw *responseWriter) bool {
 	return enc.Matcher.Match(rw.statusCode, rw.Header())
 }
 
-// Flush implements http.Flusher. It delays the actual Flush of the underlying ResponseWriterWrapper
-// until headers were written.
-func (rw *responseWriter) Flush() {
+// FlushError is an alternative Flush returning an error. It delays the actual Flush of the underlying
+// ResponseWriterWrapper until headers were written.
+func (rw *responseWriter) FlushError() error {
 	if !rw.wroteHeader {
 		// flushing the underlying ResponseWriter will write header and status code,
 		// but we need to delay that until we can determine if we must encode and
 		// therefore add the Content-Encoding header; this happens in the first call
 		// to rw.Write (see bug in #4314)
-		return
+		return nil
 	}
 	//nolint:bodyclose
-	http.NewResponseController(rw.ResponseWriter).Flush()
-}
-
-// Hijack implements http.Hijacker. It will flush status code if set. We don't track actual hijacked
-// status assuming http middlewares will track its status.
-func (rw *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	if !rw.wroteHeader {
-		if rw.statusCode != 0 {
-			rw.ResponseWriter.WriteHeader(rw.statusCode)
-		}
-		rw.wroteHeader = true
-	}
-	//nolint:bodyclose
-	return http.NewResponseController(rw.ResponseWriter).Hijack()
+	return http.NewResponseController(rw.ResponseWriter).Flush()
 }
 
 // Write writes to the response. If the response qualifies,
@@ -309,15 +349,42 @@ func (rw *responseWriter) Unwrap() http.ResponseWriter {
 
 // init should be called before we write a response, if rw.buf has contents.
 func (rw *responseWriter) init() {
-	if rw.Header().Get("Content-Encoding") == "" && isEncodeAllowed(rw.Header()) &&
+	hdr := rw.Header()
+	if hdr.Get("Content-Encoding") == "" && isEncodeAllowed(hdr) &&
 		rw.config.Match(rw) {
 		rw.w = rw.config.writerPools[rw.encodingName].Get().(Encoder)
 		rw.w.Reset(rw.ResponseWriter)
-		rw.Header().Del("Content-Length") // https://github.com/golang/go/issues/14975
-		rw.Header().Set("Content-Encoding", rw.encodingName)
-		rw.Header().Add("Vary", "Accept-Encoding")
-		rw.Header().Del("Accept-Ranges") // we don't know ranges for dynamically-encoded content
+		hdr.Del("Content-Length") // https://github.com/golang/go/issues/14975
+		hdr.Set("Content-Encoding", rw.encodingName)
+		if !hasVaryValue(hdr, "Accept-Encoding") {
+			hdr.Add("Vary", "Accept-Encoding")
+		}
+		hdr.Del("Accept-Ranges") // we don't know ranges for dynamically-encoded content
+
+		// strong ETags need to be distinct depending on the encoding ("selected representation")
+		// see RFC 9110 section 8.8.3.3:
+		// https://www.rfc-editor.org/rfc/rfc9110.html#name-example-entity-tags-varying
+		// I don't know a great way to do this... how about appending? That's a neat trick!
+		// (We have to strip the value we append from If-None-Match headers before
+		// sending subsequent requests back upstream, however, since upstream handlers
+		// don't know about our appending to their Etag since they've already done their work)
+		if etag := hdr.Get("Etag"); etag != "" && !strings.HasPrefix(etag, "W/") {
+			etag = fmt.Sprintf(`%s-%s"`, strings.TrimSuffix(etag, `"`), rw.encodingName)
+			hdr.Set("Etag", etag)
+		}
 	}
+}
+
+func hasVaryValue(hdr http.Header, target string) bool {
+	for _, vary := range hdr.Values("Vary") {
+		vals := strings.Split(vary, ",")
+		for _, val := range vals {
+			if strings.EqualFold(strings.TrimSpace(val), target) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // AcceptedEncodings returns the list of encodings that the

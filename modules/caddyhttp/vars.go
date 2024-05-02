@@ -57,6 +57,12 @@ func (m VarsMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next H
 			v = repl.ReplaceAll(valStr, "")
 		}
 		vars[keyExpanded] = v
+
+		// Special case: the user ID is in the replacer, pulled from there
+		// for access logs. Allow users to override it with the vars handler.
+		if keyExpanded == "http.auth.user.id" {
+			repl.Set(keyExpanded, v)
+		}
 	}
 	return next.ServeHTTP(w, r)
 }
@@ -184,6 +190,8 @@ func (m VarsMatcher) Match(r *http.Request) bool {
 				varStr = vv.String()
 			case error:
 				varStr = vv.Error()
+			case nil:
+				varStr = ""
 			default:
 				varStr = fmt.Sprintf("%v", vv)
 			}
@@ -234,6 +242,11 @@ func (m *MatchVarsRE) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			val = second
 		}
 
+		// Default to the named matcher's name, if no regexp name is provided
+		if name == "" {
+			name = d.GetContextString(caddyfile.MatcherNameCtxKey)
+		}
+
 		(*m)[field] = &MatchRegexp{Pattern: val, Name: name}
 		if d.NextBlock(0) {
 			return d.Err("malformed vars_regexp matcher: blocks are not supported")
@@ -275,6 +288,8 @@ func (m MatchVarsRE) Match(r *http.Request) bool {
 			varStr = vv.String()
 		case error:
 			varStr = vv.Error()
+		case nil:
+			varStr = ""
 		default:
 			varStr = fmt.Sprintf("%v", vv)
 		}

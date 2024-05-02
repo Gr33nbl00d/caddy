@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"testing"
 )
 
@@ -238,9 +239,10 @@ func TestReplacerSet(t *testing.T) {
 
 func TestReplacerReplaceKnown(t *testing.T) {
 	rep := Replacer{
-		providers: []ReplacerFunc{
+		mapMutex: &sync.RWMutex{},
+		providers: []replacementProvider{
 			// split our possible vars to two functions (to test if both functions are called)
-			func(key string) (val any, ok bool) {
+			ReplacerFunc(func(key string) (val any, ok bool) {
 				switch key {
 				case "test1":
 					return "val1", true
@@ -253,8 +255,8 @@ func TestReplacerReplaceKnown(t *testing.T) {
 				default:
 					return "NOOO", false
 				}
-			},
-			func(key string) (val any, ok bool) {
+			}),
+			ReplacerFunc(func(key string) (val any, ok bool) {
 				switch key {
 				case "1":
 					return "test-123", true
@@ -265,7 +267,7 @@ func TestReplacerReplaceKnown(t *testing.T) {
 				default:
 					return "NOOO", false
 				}
-			},
+			}),
 		},
 	}
 
@@ -310,6 +312,7 @@ func TestReplacerReplaceKnown(t *testing.T) {
 
 func TestReplacerDelete(t *testing.T) {
 	rep := Replacer{
+		mapMutex: &sync.RWMutex{},
 		static: map[string]any{
 			"key1": "val1",
 			"key2": "val2",
@@ -369,53 +372,99 @@ func TestReplacerMap(t *testing.T) {
 }
 
 func TestReplacerNew(t *testing.T) {
-	rep := NewReplacer()
+	repl := NewReplacer()
 
-	if len(rep.providers) != 2 {
-		t.Errorf("Expected providers length '%v' got length '%v'", 2, len(rep.providers))
-	} else {
-		// test if default global replacements are added  as the first provider
-		hostname, _ := os.Hostname()
-		wd, _ := os.Getwd()
-		os.Setenv("CADDY_REPLACER_TEST", "envtest")
-		defer os.Setenv("CADDY_REPLACER_TEST", "")
+	if len(repl.providers) != 3 {
+		t.Errorf("Expected providers length '%v' got length '%v'", 3, len(repl.providers))
+	}
 
-		for _, tc := range []struct {
-			variable string
-			value    string
-		}{
-			{
-				variable: "system.hostname",
-				value:    hostname,
-			},
-			{
-				variable: "system.slash",
-				value:    string(filepath.Separator),
-			},
-			{
-				variable: "system.os",
-				value:    runtime.GOOS,
-			},
-			{
-				variable: "system.arch",
-				value:    runtime.GOARCH,
-			},
-			{
-				variable: "system.wd",
-				value:    wd,
-			},
-			{
-				variable: "env.CADDY_REPLACER_TEST",
-				value:    "envtest",
-			},
-		} {
-			if val, ok := rep.providers[0](tc.variable); ok {
-				if val != tc.value {
-					t.Errorf("Expected value '%s' for key '%s' got '%s'", tc.value, tc.variable, val)
-				}
-			} else {
-				t.Errorf("Expected key '%s' to be recognized by first provider", tc.variable)
+	// test if default global replacements are added as the first provider
+	hostname, _ := os.Hostname()
+	wd, _ := os.Getwd()
+	os.Setenv("CADDY_REPLACER_TEST", "envtest")
+	defer os.Setenv("CADDY_REPLACER_TEST", "")
+
+	for _, tc := range []struct {
+		variable string
+		value    string
+	}{
+		{
+			variable: "system.hostname",
+			value:    hostname,
+		},
+		{
+			variable: "system.slash",
+			value:    string(filepath.Separator),
+		},
+		{
+			variable: "system.os",
+			value:    runtime.GOOS,
+		},
+		{
+			variable: "system.arch",
+			value:    runtime.GOARCH,
+		},
+		{
+			variable: "system.wd",
+			value:    wd,
+		},
+		{
+			variable: "env.CADDY_REPLACER_TEST",
+			value:    "envtest",
+		},
+	} {
+		if val, ok := repl.providers[0].replace(tc.variable); ok {
+			if val != tc.value {
+				t.Errorf("Expected value '%s' for key '%s' got '%s'", tc.value, tc.variable, val)
 			}
+		} else {
+			t.Errorf("Expected key '%s' to be recognized by first provider", tc.variable)
+		}
+	}
+
+	// test if file provider is added as the second provider
+	for _, tc := range []struct {
+		variable string
+		value    string
+	}{
+		{
+			variable: "file.caddytest/integration/testdata/foo.txt",
+			value:    "foo",
+		},
+	} {
+		if val, ok := repl.providers[1].replace(tc.variable); ok {
+			if val != tc.value {
+				t.Errorf("Expected value '%s' for key '%s' got '%s'", tc.value, tc.variable, val)
+			}
+		} else {
+			t.Errorf("Expected key '%s' to be recognized by second provider", tc.variable)
+		}
+	}
+}
+
+func TestReplacerNewWithoutFile(t *testing.T) {
+	repl := NewReplacer().WithoutFile()
+
+	for _, tc := range []struct {
+		variable string
+		value    string
+		notFound bool
+	}{
+		{
+			variable: "file.caddytest/integration/testdata/foo.txt",
+			notFound: true,
+		},
+		{
+			variable: "system.os",
+			value:    runtime.GOOS,
+		},
+	} {
+		if val, ok := repl.Get(tc.variable); ok && !tc.notFound {
+			if val != tc.value {
+				t.Errorf("Expected value '%s' for key '%s' got '%s'", tc.value, tc.variable, val)
+			}
+		} else if !tc.notFound {
+			t.Errorf("Expected key '%s' to be recognized", tc.variable)
 		}
 	}
 }
@@ -461,7 +510,8 @@ func BenchmarkReplacer(b *testing.B) {
 
 func testReplacer() Replacer {
 	return Replacer{
-		providers: make([]ReplacerFunc, 0),
+		providers: make([]replacementProvider, 0),
 		static:    make(map[string]any),
+		mapMutex:  &sync.RWMutex{},
 	}
 }
