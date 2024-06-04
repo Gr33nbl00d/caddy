@@ -81,6 +81,16 @@ type TLS struct {
 	// EXPERIMENTAL. Subject to change.
 	DisableOCSPStapling bool `json:"disable_ocsp_stapling,omitempty"`
 
+	// Disables checks in certmagic that the configured storage is ready
+	// and able to handle writing new content to it. These checks are
+	// intended to prevent information loss (newly issued certificates), but
+	// can be expensive on the storage.
+	//
+	// Disabling these checks should only be done when the storage
+	// can be trusted to have enough capacity and no other problems.
+	// EXPERIMENTAL. Subject to change.
+	DisableStorageCheck bool `json:"disable_storage_check,omitempty"`
+
 	certificateLoaders []CertificateLoader
 	automateNames      []string
 	ctx                caddy.Context
@@ -255,6 +265,7 @@ func (t *TLS) Provision(ctx caddy.Context) error {
 		OCSP: certmagic.OCSPConfig{
 			DisableStapling: t.DisableOCSPStapling,
 		},
+		DisableStorageCheck: t.DisableStorageCheck,
 	})
 	certCacheMu.RUnlock()
 	for _, loader := range t.certificateLoaders {
@@ -353,7 +364,7 @@ func (t *TLS) Cleanup() error {
 	// if a new TLS app was loaded, remove certificates from the cache that are no longer
 	// being managed or loaded by the new config; if there is no more TLS app running,
 	// then stop cert maintenance and let the cert cache be GC'ed
-	if nextTLS := caddy.ActiveContext().AppIfConfigured("tls"); nextTLS != nil {
+	if nextTLS, err := caddy.ActiveContext().AppIfConfigured("tls"); err == nil && nextTLS != nil {
 		nextTLSApp := nextTLS.(*TLS)
 
 		// compute which certificates were managed or loaded into the cert cache by this
