@@ -28,11 +28,12 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
+	"github.com/quic-go/quic-go/qlog"
 	"go.uber.org/zap"
+	"golang.org/x/time/rate"
 
 	"github.com/caddyserver/caddy/v2/internal"
 )
@@ -57,11 +58,9 @@ type NetworkAddress struct {
 	EndPort   uint
 }
 
-// ListenAll calls Listen() for all addresses represented by this struct, i.e. all ports in the range.
+// ListenAll calls Listen for all addresses represented by this struct, i.e. all ports in the range.
 // (If the address doesn't use ports or has 1 port only, then only 1 listener will be created.)
 // It returns an error if any listener failed to bind, and closes any listeners opened up to that point.
-//
-// TODO: Experimental API: subject to change or removal.
 func (na NetworkAddress) ListenAll(ctx context.Context, config net.ListenConfig) ([]any, error) {
 	var listeners []any
 	var err error
@@ -107,7 +106,8 @@ func (na NetworkAddress) ListenAll(ctx context.Context, config net.ListenConfig)
 // portOffset to the start port. (For network types that do not use ports, the
 // portOffset is ignored.)
 //
-// The provided ListenConfig is used to create the listener. Its Control function,
+// First Listen checks if a plugin can provide a listener from this address. Otherwise,
+// the provided ListenConfig is used to create the listener. Its Control function,
 // if set, may be wrapped by an internally-used Control function. The provided
 // context may be used to cancel long operations early. The context is not used
 // to close the listener after it has been created.
@@ -130,8 +130,8 @@ func (na NetworkAddress) ListenAll(ctx context.Context, config net.ListenConfig)
 // Unix sockets will be unlinked before being created, to ensure we can bind to
 // it even if the previous program using it exited uncleanly; it will also be
 // unlinked upon a graceful exit (or when a new config does not use that socket).
-//
-// TODO: Experimental API: subject to change or removal.
+// Listen synchronizes binds to unix domain sockets to avoid race conditions
+// while an existing socket is unlinked.
 func (na NetworkAddress) Listen(ctx context.Context, portOffset uint, config net.ListenConfig) (any, error) {
 	if na.IsUnixNetwork() {
 		unixSocketsMu.Lock()
@@ -139,7 +139,7 @@ func (na NetworkAddress) Listen(ctx context.Context, portOffset uint, config net
 	}
 
 	// check to see if plugin provides listener
-	if ln, err := getListenerFromPlugin(ctx, na.Network, na.JoinHostPort(portOffset), config); ln != nil || err != nil {
+	if ln, err := getListenerFromPlugin(ctx, na.Network, na.Host, na.port(), portOffset, config); ln != nil || err != nil {
 		return ln, err
 	}
 
@@ -149,54 +149,53 @@ func (na NetworkAddress) Listen(ctx context.Context, portOffset uint, config net
 
 func (na NetworkAddress) listen(ctx context.Context, portOffset uint, config net.ListenConfig) (any, error) {
 	var (
-		ln                  any
-		err                 error
-		address             string
-		unixFileMode        fs.FileMode
-		isAbtractUnixSocket bool
+		ln           any
+		err          error
+		address      string
+		unixFileMode fs.FileMode
 	)
 
 	// split unix socket addr early so lnKey
 	// is independent of permissions bits
 	if na.IsUnixNetwork() {
-		var err error
 		address, unixFileMode, err = internal.SplitUnixSocketPermissionsBits(na.Host)
 		if err != nil {
 			return nil, err
 		}
-		isAbtractUnixSocket = strings.HasPrefix(address, "@")
+	} else if na.IsFdNetwork() {
+		address = na.Host
 	} else {
 		address = na.JoinHostPort(portOffset)
 	}
 
-	// if this is a unix socket, see if we already have it open,
-	// force socket permissions on it and return early
-	if socket, err := reuseUnixSocket(na.Network, address); socket != nil || err != nil {
-		if !isAbtractUnixSocket {
-			if err := os.Chmod(address, unixFileMode); err != nil {
-				return nil, fmt.Errorf("unable to set permissions (%s) on %s: %v", unixFileMode, address, err)
-			}
-		}
-		return socket, err
-	}
-
-	lnKey := listenerKey(na.Network, address)
-
 	if strings.HasPrefix(na.Network, "ip") {
 		ln, err = config.ListenPacket(ctx, na.Network, address)
 	} else {
-		ln, err = listenReusable(ctx, lnKey, na.Network, address, config)
+		if na.IsUnixNetwork() {
+			// if this is a unix socket, see if we already have it open
+			ln, err = reuseUnixSocket(na.Network, address)
+		}
+
+		if ln == nil && err == nil {
+			// otherwise, create a new listener
+			lnKey := listenerKey(na.Network, address)
+			ln, err = listenReusable(ctx, lnKey, na.Network, address, config)
+		}
 	}
+
 	if err != nil {
 		return nil, err
 	}
+
 	if ln == nil {
 		return nil, fmt.Errorf("unsupported network type: %s", na.Network)
 	}
 
 	if IsUnixNetwork(na.Network) {
-		if !isAbtractUnixSocket {
-			if err := os.Chmod(address, unixFileMode); err != nil {
+		isAbstractUnixSocket := strings.HasPrefix(address, "@")
+		if !isAbstractUnixSocket {
+			err = os.Chmod(address, unixFileMode)
+			if err != nil {
 				return nil, fmt.Errorf("unable to set permissions (%s) on %s: %v", unixFileMode, address, err)
 			}
 		}
@@ -211,18 +210,22 @@ func (na NetworkAddress) IsUnixNetwork() bool {
 	return IsUnixNetwork(na.Network)
 }
 
+// IsFdNetwork returns true if na.Network is
+// fd or fdgram.
+func (na NetworkAddress) IsFdNetwork() bool {
+	return IsFdNetwork(na.Network)
+}
+
 // JoinHostPort is like net.JoinHostPort, but where the port
 // is StartPort + offset.
 func (na NetworkAddress) JoinHostPort(offset uint) string {
-	if na.IsUnixNetwork() {
+	if na.IsUnixNetwork() || na.IsFdNetwork() {
 		return na.Host
 	}
-	return net.JoinHostPort(na.Host, strconv.Itoa(int(na.StartPort+offset)))
+	return net.JoinHostPort(na.Host, strconv.FormatUint(uint64(na.StartPort+offset), 10))
 }
 
 // Expand returns one NetworkAddress for each port in the port range.
-//
-// This is EXPERIMENTAL and subject to change or removal.
 func (na NetworkAddress) Expand() []NetworkAddress {
 	size := na.PortRangeSize()
 	addrs := make([]NetworkAddress, size)
@@ -253,7 +256,7 @@ func (na NetworkAddress) PortRangeSize() uint {
 }
 
 func (na NetworkAddress) isLoopback() bool {
-	if na.IsUnixNetwork() {
+	if na.IsUnixNetwork() || na.IsFdNetwork() {
 		return true
 	}
 	if na.Host == "localhost" {
@@ -297,6 +300,11 @@ func IsUnixNetwork(netw string) bool {
 	return strings.HasPrefix(netw, "unix")
 }
 
+// IsFdNetwork returns true if the netw is a fd network.
+func IsFdNetwork(netw string) bool {
+	return strings.HasPrefix(netw, "fd")
+}
+
 // ParseNetworkAddress parses addr into its individual
 // components. The input string is expected to be of
 // the form "network/host:port-range" where any part is
@@ -326,6 +334,12 @@ func ParseNetworkAddressWithDefaults(addr, defaultNetwork string, defaultPort ui
 			Network: network,
 			Host:    host,
 		}, err
+	}
+	if IsFdNetwork(network) {
+		return NetworkAddress{
+			Network: network,
+			Host:    host,
+		}, nil
 	}
 	var start, end uint64
 	if port == "" {
@@ -366,26 +380,29 @@ func SplitNetworkAddress(a string) (network, host, port string, err error) {
 	if slashFound {
 		network = strings.ToLower(strings.TrimSpace(beforeSlash))
 		a = afterSlash
+		if IsUnixNetwork(network) || IsFdNetwork(network) {
+			host = a
+			return network, host, port, err
+		}
 	}
-	if IsUnixNetwork(network) {
-		host = a
-		return
-	}
+
 	host, port, err = net.SplitHostPort(a)
-	if err == nil || a == "" {
-		return
-	}
-	// in general, if there was an error, it was likely "missing port",
-	// so try adding a bogus port to take advantage of standard library's
-	// robust parser, then strip the artificial port before returning
-	// (don't overwrite original error though; might still be relevant)
-	var err2 error
-	host, port, err2 = net.SplitHostPort(a + ":0")
-	if err2 == nil {
-		err = nil
+	firstErr := err
+
+	if err != nil {
+		// in general, if there was an error, it was likely "missing port",
+		// so try removing square brackets around an IPv6 host, adding a bogus
+		// port to take advantage of standard library's robust parser, then
+		// strip the artificial port.
+		host, _, err = net.SplitHostPort(net.JoinHostPort(strings.Trim(a, "[]"), "0"))
 		port = ""
 	}
-	return
+
+	if err != nil {
+		err = errors.Join(firstErr, err)
+	}
+
+	return network, host, port, err
 }
 
 // JoinNetworkAddress combines network, host, and port into a single
@@ -398,7 +415,7 @@ func JoinNetworkAddress(network, host, port string) string {
 	if network != "" {
 		a = network + "/"
 	}
-	if (host != "" && port == "") || IsUnixNetwork(network) {
+	if (host != "" && port == "") || IsUnixNetwork(network) || IsFdNetwork(network) {
 		a += host
 	} else if port != "" {
 		a += net.JoinHostPort(host, port)
@@ -406,48 +423,15 @@ func JoinNetworkAddress(network, host, port string) string {
 	return a
 }
 
-// DEPRECATED: Use NetworkAddress.Listen instead. This function will likely be changed or removed in the future.
-func Listen(network, addr string) (net.Listener, error) {
-	// a 0 timeout means Go uses its default
-	return ListenTimeout(network, addr, 0)
-}
-
-// DEPRECATED: Use NetworkAddress.Listen instead. This function will likely be changed or removed in the future.
-func ListenTimeout(network, addr string, keepalivePeriod time.Duration) (net.Listener, error) {
-	netAddr, err := ParseNetworkAddress(JoinNetworkAddress(network, addr, ""))
-	if err != nil {
-		return nil, err
-	}
-
-	ln, err := netAddr.Listen(context.TODO(), 0, net.ListenConfig{KeepAlive: keepalivePeriod})
-	if err != nil {
-		return nil, err
-	}
-
-	return ln.(net.Listener), nil
-}
-
-// DEPRECATED: Use NetworkAddress.Listen instead. This function will likely be changed or removed in the future.
-func ListenPacket(network, addr string) (net.PacketConn, error) {
-	netAddr, err := ParseNetworkAddress(JoinNetworkAddress(network, addr, ""))
-	if err != nil {
-		return nil, err
-	}
-
-	ln, err := netAddr.Listen(context.TODO(), 0, net.ListenConfig{})
-	if err != nil {
-		return nil, err
-	}
-
-	return ln.(net.PacketConn), nil
-}
-
-// ListenQUIC returns a quic.EarlyListener suitable for use in a Caddy module.
-// The network will be transformed into a QUIC-compatible type (if unix, then
-// unixgram will be used; otherwise, udp will be used).
+// ListenQUIC returns a http3.QUICEarlyListener suitable for use in a Caddy module.
+//
+// The network will be transformed into a QUIC-compatible type if the same address can be used with
+// different networks. Currently this just means that for tcp, udp will be used with the same
+// address instead.
 //
 // NOTE: This API is EXPERIMENTAL and may be changed or removed.
-func (na NetworkAddress) ListenQUIC(ctx context.Context, portOffset uint, config net.ListenConfig, tlsConf *tls.Config, activeRequests *int64) (http3.QUICEarlyListener, error) {
+// NOTE: user should close the returned listener twice, once to stop accepting new connections, the second time to free up the packet conn.
+func (na NetworkAddress) ListenQUIC(ctx context.Context, portOffset uint, config net.ListenConfig, tlsConf *tls.Config) (http3.QUICListener, error) {
 	lnKey := listenerKey("quic"+na.Network, na.JoinHostPort(portOffset))
 
 	sharedEarlyListener, _, err := listenerPool.LoadOrNew(lnKey, func() (Destructor, error) {
@@ -468,20 +452,28 @@ func (na NetworkAddress) ListenQUIC(ctx context.Context, portOffset uint, config
 			}
 		}
 
-		sqs := newSharedQUICState(tlsConf, activeRequests)
+		sqs := newSharedQUICState(tlsConf)
 		// http3.ConfigureTLSConfig only uses this field and tls App sets this field as well
 		//nolint:gosec
 		quicTlsConfig := &tls.Config{GetConfigForClient: sqs.getConfigForClient}
-		earlyLn, err := quic.ListenEarly(h3ln, http3.ConfigureTLSConfig(quicTlsConfig), &quic.Config{
-			Allow0RTT: true,
-			RequireAddressValidation: func(clientAddr net.Addr) bool {
-				// TODO: make tunable?
-				return sqs.getActiveRequests() > 1000
+		// Require clients to verify their source address when we're handling more than 1000 handshakes per second.
+		// TODO: make tunable?
+		limiter := rate.NewLimiter(1000, 1000)
+		tr := &quic.Transport{
+			Conn:                h3ln,
+			VerifySourceAddress: func(addr net.Addr) bool { return !limiter.Allow() },
+		}
+		earlyLn, err := tr.ListenEarly(
+			http3.ConfigureTLSConfig(quicTlsConfig),
+			&quic.Config{
+				Allow0RTT: true,
+				Tracer:    qlog.DefaultConnectionTracer,
 			},
-		})
+		)
 		if err != nil {
 			return nil, err
 		}
+		// TODO: figure out when to close the listener and the transport
 		// using the original net.PacketConn to close them properly
 		return &sharedQuicListener{EarlyListener: earlyLn, packetConn: ln, sqs: sqs, key: lnKey}, nil
 	})
@@ -490,47 +482,8 @@ func (na NetworkAddress) ListenQUIC(ctx context.Context, portOffset uint, config
 	}
 
 	sql := sharedEarlyListener.(*sharedQuicListener)
-	// add current tls.Config to sqs, so GetConfigForClient will always return the latest tls.Config in case of context cancellation,
-	// and the request counter will reflect current http server
-	ctx, cancel := sql.sqs.addState(tlsConf, activeRequests)
-
-	return &fakeCloseQuicListener{
-		sharedQuicListener: sql,
-		context:            ctx,
-		contextCancel:      cancel,
-	}, nil
-}
-
-// DEPRECATED: Use NetworkAddress.ListenQUIC instead. This function will likely be changed or removed in the future.
-// TODO: See if we can find a more elegant solution closer to the new NetworkAddress.Listen API.
-func ListenQUIC(ln net.PacketConn, tlsConf *tls.Config, activeRequests *int64) (http3.QUICEarlyListener, error) {
-	lnKey := listenerKey("quic+"+ln.LocalAddr().Network(), ln.LocalAddr().String())
-
-	sharedEarlyListener, _, err := listenerPool.LoadOrNew(lnKey, func() (Destructor, error) {
-		sqs := newSharedQUICState(tlsConf, activeRequests)
-		// http3.ConfigureTLSConfig only uses this field and tls App sets this field as well
-		//nolint:gosec
-		quicTlsConfig := &tls.Config{GetConfigForClient: sqs.getConfigForClient}
-		earlyLn, err := quic.ListenEarly(ln, http3.ConfigureTLSConfig(quicTlsConfig), &quic.Config{
-			Allow0RTT: true,
-			RequireAddressValidation: func(clientAddr net.Addr) bool {
-				// TODO: make tunable?
-				return sqs.getActiveRequests() > 1000
-			},
-		})
-		if err != nil {
-			return nil, err
-		}
-		return &sharedQuicListener{EarlyListener: earlyLn, sqs: sqs, key: lnKey}, nil
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	sql := sharedEarlyListener.(*sharedQuicListener)
-	// add current tls.Config and request counter to sqs, so GetConfigForClient will always return the latest tls.Config in case of context cancellation,
-	// and the request counter will reflect current http server
-	ctx, cancel := sql.sqs.addState(tlsConf, activeRequests)
+	// add current tls.Config to sqs, so GetConfigForClient will always return the latest tls.Config in case of context cancellation
+	ctx, cancel := sql.sqs.addState(tlsConf)
 
 	return &fakeCloseQuicListener{
 		sharedQuicListener: sql,
@@ -551,25 +504,21 @@ type contextAndCancelFunc struct {
 	context.CancelFunc
 }
 
-// sharedQUICState manages GetConfigForClient and current number of active requests
+// sharedQUICState manages GetConfigForClient
 // see issue: https://github.com/caddyserver/caddy/pull/4849
 type sharedQUICState struct {
-	rmu                   sync.RWMutex
-	tlsConfs              map[*tls.Config]contextAndCancelFunc
-	requestCounters       map[*tls.Config]*int64
-	activeTlsConf         *tls.Config
-	activeRequestsCounter *int64
+	rmu           sync.RWMutex
+	tlsConfs      map[*tls.Config]contextAndCancelFunc
+	activeTlsConf *tls.Config
 }
 
 // newSharedQUICState creates a new sharedQUICState
-func newSharedQUICState(tlsConfig *tls.Config, activeRequests *int64) *sharedQUICState {
+func newSharedQUICState(tlsConfig *tls.Config) *sharedQUICState {
 	sqtc := &sharedQUICState{
-		tlsConfs:              make(map[*tls.Config]contextAndCancelFunc),
-		requestCounters:       make(map[*tls.Config]*int64),
-		activeTlsConf:         tlsConfig,
-		activeRequestsCounter: activeRequests,
+		tlsConfs:      make(map[*tls.Config]contextAndCancelFunc),
+		activeTlsConf: tlsConfig,
 	}
-	sqtc.addState(tlsConfig, activeRequests)
+	sqtc.addState(tlsConfig)
 	return sqtc
 }
 
@@ -580,17 +529,9 @@ func (sqs *sharedQUICState) getConfigForClient(ch *tls.ClientHelloInfo) (*tls.Co
 	return sqs.activeTlsConf.GetConfigForClient(ch)
 }
 
-// getActiveRequests returns the number of active requests
-func (sqs *sharedQUICState) getActiveRequests() int64 {
-	// Prevent a race when a context is cancelled and active request counter is being changed
-	sqs.rmu.RLock()
-	defer sqs.rmu.RUnlock()
-	return atomic.LoadInt64(sqs.activeRequestsCounter)
-}
-
 // addState adds tls.Config and activeRequests to the map if not present and returns the corresponding context and its cancelFunc
-// so that when cancelled, the active tls.Config and request counter will change
-func (sqs *sharedQUICState) addState(tlsConfig *tls.Config, activeRequests *int64) (context.Context, context.CancelFunc) {
+// so that when cancelled, the active tls.Config will change
+func (sqs *sharedQUICState) addState(tlsConfig *tls.Config) (context.Context, context.CancelFunc) {
 	sqs.rmu.Lock()
 	defer sqs.rmu.Unlock()
 
@@ -606,19 +547,16 @@ func (sqs *sharedQUICState) addState(tlsConfig *tls.Config, activeRequests *int6
 		defer sqs.rmu.Unlock()
 
 		delete(sqs.tlsConfs, tlsConfig)
-		delete(sqs.requestCounters, tlsConfig)
 		if sqs.activeTlsConf == tlsConfig {
-			// select another tls.Config and request counter, if there is none,
+			// select another tls.Config, if there is none,
 			// related sharedQuicListener will be destroyed anyway
-			for tc, counter := range sqs.requestCounters {
+			for tc := range sqs.tlsConfs {
 				sqs.activeTlsConf = tc
-				sqs.activeRequestsCounter = counter
 				break
 			}
 		}
 	}
 	sqs.tlsConfs[tlsConfig] = contextAndCancelFunc{ctx, wrappedCancel}
-	sqs.requestCounters[tlsConfig] = activeRequests
 	// there should be at most 2 tls.Configs
 	if len(sqs.tlsConfs) > 2 {
 		Log().Warn("quic listener tls configs are more than 2", zap.Int("number of configs", len(sqs.tlsConfs)))
@@ -673,7 +611,7 @@ type fakeCloseQuicListener struct {
 // server on which Accept would be called with non-empty contexts
 // (mind that the default net listeners' Accept doesn't take a context argument)
 // sounds way too rare for us to sacrifice efficiency here.
-func (fcql *fakeCloseQuicListener) Accept(_ context.Context) (quic.EarlyConnection, error) {
+func (fcql *fakeCloseQuicListener) Accept(_ context.Context) (*quic.Conn, error) {
 	conn, err := fcql.sharedQuicListener.Accept(fcql.context)
 	if err == nil {
 		return conn, nil
@@ -689,6 +627,7 @@ func (fcql *fakeCloseQuicListener) Accept(_ context.Context) (quic.EarlyConnecti
 func (fcql *fakeCloseQuicListener) Close() error {
 	if atomic.CompareAndSwapInt32(&fcql.closed, 0, 1) {
 		fcql.contextCancel()
+	} else if atomic.CompareAndSwapInt32(&fcql.closed, 1, 2) {
 		_, _ = listenerPool.Delete(fcql.sharedQuicListener.key)
 	}
 	return nil
@@ -704,7 +643,8 @@ func RegisterNetwork(network string, getListener ListenerFunc) {
 	if network == "tcp" || network == "tcp4" || network == "tcp6" ||
 		network == "udp" || network == "udp4" || network == "udp6" ||
 		network == "unix" || network == "unixpacket" || network == "unixgram" ||
-		strings.HasPrefix("ip:", network) || strings.HasPrefix("ip4:", network) || strings.HasPrefix("ip6:", network) {
+		strings.HasPrefix(network, "ip:") || strings.HasPrefix(network, "ip4:") || strings.HasPrefix(network, "ip6:") ||
+		network == "fd" || network == "fdgram" {
 		panic("network type " + network + " is reserved")
 	}
 
@@ -720,11 +660,11 @@ var unixSocketsMu sync.Mutex
 // getListenerFromPlugin returns a listener on the given network and address
 // if a plugin has registered the network name. It may return (nil, nil) if
 // no plugin can provide a listener.
-func getListenerFromPlugin(ctx context.Context, network, addr string, config net.ListenConfig) (any, error) {
+func getListenerFromPlugin(ctx context.Context, network, host, port string, portOffset uint, config net.ListenConfig) (any, error) {
 	// get listener from plugin if network type is registered
 	if getListener, ok := networkTypes[network]; ok {
 		Log().Debug("getting listener from plugin", zap.String("network", network))
-		return getListener(ctx, network, addr, config)
+		return getListener(ctx, network, host, port, portOffset, config)
 	}
 
 	return nil, nil
@@ -738,7 +678,7 @@ func listenerKey(network, addr string) string {
 // The listeners must be capable of overlapping: with Caddy, new configs are loaded
 // before old ones are unloaded, so listeners may overlap briefly if the configs
 // both need the same listener. EXPERIMENTAL and subject to change.
-type ListenerFunc func(ctx context.Context, network, addr string, cfg net.ListenConfig) (any, error)
+type ListenerFunc func(ctx context.Context, network, host, portRange string, portOffset uint, cfg net.ListenConfig) (any, error)
 
 var networkTypes = map[string]ListenerFunc{}
 

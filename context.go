@@ -23,6 +23,8 @@ import (
 	"reflect"
 
 	"github.com/caddyserver/certmagic"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"go.uber.org/zap"
 	"go.uber.org/zap/exp/zapslog"
 
@@ -44,8 +46,10 @@ type Context struct {
 
 	moduleInstances map[string][]Module
 	cfg             *Config
-	cleanupFuncs    []func()
 	ancestry        []Module
+	cleanupFuncs    []func()                // invoked at every config unload
+	exitFuncs       []func(context.Context) // invoked at config unload ONLY IF the process is exiting (EXPERIMENTAL)
+	metricsRegistry *prometheus.Registry
 }
 
 // NewContext provides a new context derived from the given
@@ -57,7 +61,7 @@ type Context struct {
 // modules which are loaded will be properly unloaded.
 // See standard library context package's documentation.
 func NewContext(ctx Context) (Context, context.CancelFunc) {
-	newCtx := Context{moduleInstances: make(map[string][]Module), cfg: ctx.cfg}
+	newCtx := Context{moduleInstances: make(map[string][]Module), cfg: ctx.cfg, metricsRegistry: prometheus.NewPedanticRegistry()}
 	c, cancel := context.WithCancel(ctx.Context)
 	wrappedCancel := func() {
 		cancel()
@@ -78,6 +82,7 @@ func NewContext(ctx Context) (Context, context.CancelFunc) {
 		}
 	}
 	newCtx.Context = c
+	newCtx.initMetrics()
 	return newCtx, wrappedCancel
 }
 
@@ -86,13 +91,41 @@ func (ctx *Context) OnCancel(f func()) {
 	ctx.cleanupFuncs = append(ctx.cleanupFuncs, f)
 }
 
-// Filesystems returns a ref to the FilesystemMap
-func (ctx *Context) Filesystems() FileSystems {
+// FileSystems returns a ref to the FilesystemMap.
+// EXPERIMENTAL: This API is subject to change.
+func (ctx *Context) FileSystems() FileSystems {
 	// if no config is loaded, we use a default filesystemmap, which includes the osfs
 	if ctx.cfg == nil {
-		return &filesystems.FilesystemMap{}
+		return &filesystems.FileSystemMap{}
 	}
-	return ctx.cfg.filesystems
+	return ctx.cfg.fileSystems
+}
+
+// Returns the active metrics registry for the context
+// EXPERIMENTAL: This API is subject to change.
+func (ctx *Context) GetMetricsRegistry() *prometheus.Registry {
+	return ctx.metricsRegistry
+}
+
+func (ctx *Context) initMetrics() {
+	ctx.metricsRegistry.MustRegister(
+		collectors.NewBuildInfoCollector(),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+		collectors.NewGoCollector(),
+		adminMetrics.requestCount,
+		adminMetrics.requestErrors,
+		globalMetrics.configSuccess,
+		globalMetrics.configSuccessTime,
+	)
+}
+
+// OnExit executes f when the process exits gracefully.
+// The function is only executed if the process is gracefully
+// shut down while this context is active.
+//
+// EXPERIMENTAL API: subject to change or removal.
+func (ctx *Context) OnExit(f func(context.Context)) {
+	ctx.exitFuncs = append(ctx.exitFuncs, f)
 }
 
 // LoadModule loads the Caddy module(s) from the specified field of the parent struct
@@ -244,6 +277,14 @@ func (ctx Context) LoadModule(structPointer any, fieldName string) (any, error) 
 	return result, nil
 }
 
+// emitEvent is a small convenience method so the caddy core can emit events, if the event app is configured.
+func (ctx Context) emitEvent(name string, data map[string]any) Event {
+	if ctx.cfg == nil || ctx.cfg.eventEmitter == nil {
+		return Event{}
+	}
+	return ctx.cfg.eventEmitter.Emit(ctx, name, data)
+}
+
 // loadModulesFromSomeMap loads modules from val, which must be a type of map[string]any.
 // Depending on inlineModuleKey, it will be interpreted as either a ModuleMap (key is the module
 // name) or as a regular map (key is not the module name, and module name is defined inline).
@@ -352,10 +393,28 @@ func (ctx Context) LoadModuleByID(id string, rawMsg json.RawMessage) (any, error
 		return nil, fmt.Errorf("module value cannot be null")
 	}
 
+	var err error
+
+	// if this is an app module, keep a reference to it,
+	// since submodules may need to reference it during
+	// provisioning (even though the parent app module
+	// may not be fully provisioned yet; this is the case
+	// with the tls app's automation policies, which may
+	// refer to the tls app to check if a global DNS
+	// module has been configured for DNS challenges)
+	if appModule, ok := val.(App); ok {
+		ctx.cfg.apps[id] = appModule
+		defer func() {
+			if err != nil {
+				ctx.cfg.failedApps[id] = err
+			}
+		}()
+	}
+
 	ctx.ancestry = append(ctx.ancestry, val)
 
 	if prov, ok := val.(Provisioner); ok {
-		err := prov.Provision(ctx)
+		err = prov.Provision(ctx)
 		if err != nil {
 			// incomplete provisioning could have left state
 			// dangling, so make sure it gets cleaned up
@@ -370,7 +429,7 @@ func (ctx Context) LoadModuleByID(id string, rawMsg json.RawMessage) (any, error
 	}
 
 	if validator, ok := val.(Validator); ok {
-		err := validator.Validate()
+		err = validator.Validate()
 		if err != nil {
 			// since the module was already provisioned, make sure we clean up
 			if cleanerUpper, ok := val.(CleanerUpper); ok {
@@ -384,6 +443,14 @@ func (ctx Context) LoadModuleByID(id string, rawMsg json.RawMessage) (any, error
 	}
 
 	ctx.moduleInstances[id] = append(ctx.moduleInstances[id], val)
+
+	// if the loaded module happens to be an app that can emit events, store it so the
+	// core can have access to emit events without an import cycle
+	if ee, ok := val.(eventEmitter); ok {
+		if _, ok := ee.(App); ok {
+			ctx.cfg.eventEmitter = ee
+		}
+	}
 
 	return val, nil
 }
@@ -427,6 +494,10 @@ func (ctx Context) loadModuleInline(moduleNameKey, moduleScope string, raw json.
 // or stop App modules. The caller is expected to assert to the
 // concrete type.
 func (ctx Context) App(name string) (any, error) {
+	// if the app failed to load before, return the cached error
+	if err, ok := ctx.cfg.failedApps[name]; ok {
+		return nil, fmt.Errorf("loading %s app module: %v", name, err)
+	}
 	if app, ok := ctx.cfg.apps[name]; ok {
 		return app, nil
 	}
@@ -438,28 +509,35 @@ func (ctx Context) App(name string) (any, error) {
 	if appRaw != nil {
 		ctx.cfg.AppsRaw[name] = nil // allow GC to deallocate
 	}
-	ctx.cfg.apps[name] = modVal.(App)
 	return modVal, nil
 }
 
-// AppIfConfigured returns an app by its name if it has been
-// configured. Can be called instead of App() to avoid
-// instantiating an empty app when that's not desirable. If
-// the app has not been loaded, nil is returned.
-//
-// We return any type instead of the App type because it is not
-// intended for the caller of this method to be the one to start
-// or stop App modules. The caller is expected to assert to the
-// concrete type.
-func (ctx Context) AppIfConfigured(name string) any {
+// AppIfConfigured is like App, but it returns an error if the
+// app has not been configured. This is useful when the app is
+// required and its absence is a configuration error; or when
+// the app is optional and you don't want to instantiate a
+// new one that hasn't been explicitly configured. If the app
+// is not in the configuration, the error wraps ErrNotConfigured.
+func (ctx Context) AppIfConfigured(name string) (any, error) {
 	if ctx.cfg == nil {
-		// this can happen if the currently-active context
-		// is being accessed, but no config has successfully
-		// been loaded yet
-		return nil
+		return nil, fmt.Errorf("app module %s: %w", name, ErrNotConfigured)
 	}
-	return ctx.cfg.apps[name]
+	// if the app failed to load before, return the cached error
+	if err, ok := ctx.cfg.failedApps[name]; ok {
+		return nil, fmt.Errorf("loading %s app module: %v", name, err)
+	}
+	if app, ok := ctx.cfg.apps[name]; ok {
+		return app, nil
+	}
+	appRaw := ctx.cfg.AppsRaw[name]
+	if appRaw == nil {
+		return nil, fmt.Errorf("app module %s: %w", name, ErrNotConfigured)
+	}
+	return ctx.App(name)
 }
+
+// ErrNotConfigured indicates a module is not configured.
+var ErrNotConfigured = fmt.Errorf("module not configured")
 
 // Storage returns the configured Caddy storage implementation.
 func (ctx Context) Storage() certmagic.Storage {
@@ -514,18 +592,14 @@ func (ctx Context) Slogger() *slog.Logger {
 		if err != nil {
 			panic("config missing, unable to create dev logger: " + err.Error())
 		}
-		return slog.New(zapslog.NewHandler(l.Core(), nil))
+		return slog.New(zapslog.NewHandler(l.Core()))
 	}
 	mod := ctx.Module()
 	if mod == nil {
-		return slog.New(zapslog.NewHandler(Log().Core(), nil))
+		return slog.New(zapslog.NewHandler(Log().Core()))
 	}
-
-	return slog.New(zapslog.NewHandler(
-		ctx.cfg.Logging.Logger(mod).Core(),
-		&zapslog.HandlerOptions{
-			LoggerName: string(mod.CaddyModule().ID),
-		},
+	return slog.New(zapslog.NewHandler(ctx.cfg.Logging.Logger(mod).Core(),
+		zapslog.WithName(string(mod.CaddyModule().ID)),
 	))
 }
 
@@ -544,4 +618,24 @@ func (ctx Context) Module() Module {
 		return nil
 	}
 	return ctx.ancestry[len(ctx.ancestry)-1]
+}
+
+// WithValue returns a new context with the given key-value pair.
+func (ctx *Context) WithValue(key, value any) Context {
+	return Context{
+		Context:         context.WithValue(ctx.Context, key, value),
+		moduleInstances: ctx.moduleInstances,
+		cfg:             ctx.cfg,
+		ancestry:        ctx.ancestry,
+		cleanupFuncs:    ctx.cleanupFuncs,
+		exitFuncs:       ctx.exitFuncs,
+	}
+}
+
+// eventEmitter is a small interface that inverts dependencies for
+// the caddyevents package, so the core can emit events without an
+// import cycle (i.e. the caddy package doesn't have to import
+// the caddyevents package, which imports the caddy package).
+type eventEmitter interface {
+	Emit(ctx Context, eventName string, data map[string]any) Event
 }

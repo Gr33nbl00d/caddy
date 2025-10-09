@@ -27,11 +27,13 @@ import (
 
 	"github.com/google/cel-go/cel"
 	"github.com/google/cel-go/common"
+	"github.com/google/cel-go/common/ast"
 	"github.com/google/cel-go/common/operators"
+	"github.com/google/cel-go/common/types"
 	"github.com/google/cel-go/common/types/ref"
 	"github.com/google/cel-go/parser"
 	"go.uber.org/zap"
-	exprpb "google.golang.org/genproto/googleapis/api/expr/v1alpha1"
+	"go.uber.org/zap/zapcore"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -88,6 +90,7 @@ type MatchFile struct {
 	// How to choose a file in TryFiles. Can be:
 	//
 	// - first_exist
+	// - first_exist_fallback
 	// - smallest_size
 	// - largest_size
 	// - most_recently_modified
@@ -171,7 +174,7 @@ func (m *MatchFile) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 func (MatchFile) CELLibrary(ctx caddy.Context) (cel.Library, error) {
 	requestType := cel.ObjectType("http.Request")
 
-	matcherFactory := func(data ref.Val) (caddyhttp.RequestMatcher, error) {
+	matcherFactory := func(data ref.Val) (caddyhttp.RequestMatcherWithError, error) {
 		values, err := caddyhttp.CELValueToMapStrList(data)
 		if err != nil {
 			return nil, err
@@ -189,7 +192,7 @@ func (MatchFile) CELLibrary(ctx caddy.Context) (cel.Library, error) {
 
 		var try_policy string
 		if len(values["try_policy"]) > 0 {
-			root = values["try_policy"][0]
+			try_policy = values["try_policy"][0]
 		}
 
 		m := MatchFile{
@@ -220,46 +223,46 @@ func (MatchFile) CELLibrary(ctx caddy.Context) (cel.Library, error) {
 }
 
 func celFileMatcherMacroExpander() parser.MacroExpander {
-	return func(eh parser.ExprHelper, target *exprpb.Expr, args []*exprpb.Expr) (*exprpb.Expr, *common.Error) {
+	return func(eh parser.ExprHelper, target ast.Expr, args []ast.Expr) (ast.Expr, *common.Error) {
 		if len(args) == 0 {
-			return eh.GlobalCall("file",
-				eh.Ident("request"),
+			return eh.NewCall("file",
+				eh.NewIdent(caddyhttp.CELRequestVarName),
 				eh.NewMap(),
 			), nil
 		}
 		if len(args) == 1 {
 			arg := args[0]
 			if isCELStringLiteral(arg) || isCELCaddyPlaceholderCall(arg) {
-				return eh.GlobalCall("file",
-					eh.Ident("request"),
+				return eh.NewCall("file",
+					eh.NewIdent(caddyhttp.CELRequestVarName),
 					eh.NewMap(eh.NewMapEntry(
-						eh.LiteralString("try_files"),
+						eh.NewLiteral(types.String("try_files")),
 						eh.NewList(arg),
 						false,
 					)),
 				), nil
 			}
 			if isCELTryFilesLiteral(arg) {
-				return eh.GlobalCall("file", eh.Ident("request"), arg), nil
+				return eh.NewCall("file", eh.NewIdent(caddyhttp.CELRequestVarName), arg), nil
 			}
 			return nil, &common.Error{
-				Location: eh.OffsetLocation(arg.GetId()),
+				Location: eh.OffsetLocation(arg.ID()),
 				Message:  "matcher requires either a map or string literal argument",
 			}
 		}
 
 		for _, arg := range args {
-			if !(isCELStringLiteral(arg) || isCELCaddyPlaceholderCall(arg)) {
+			if !isCELStringLiteral(arg) && !isCELCaddyPlaceholderCall(arg) {
 				return nil, &common.Error{
-					Location: eh.OffsetLocation(arg.GetId()),
+					Location: eh.OffsetLocation(arg.ID()),
 					Message:  "matcher only supports repeated string literal arguments",
 				}
 			}
 		}
-		return eh.GlobalCall("file",
-			eh.Ident("request"),
+		return eh.NewCall("file",
+			eh.NewIdent(caddyhttp.CELRequestVarName),
 			eh.NewMap(eh.NewMapEntry(
-				eh.LiteralString("try_files"),
+				eh.NewLiteral(types.String("try_files")),
 				eh.NewList(args...),
 				false,
 			)),
@@ -271,7 +274,7 @@ func celFileMatcherMacroExpander() parser.MacroExpander {
 func (m *MatchFile) Provision(ctx caddy.Context) error {
 	m.logger = ctx.Logger()
 
-	m.fsmap = ctx.Filesystems()
+	m.fsmap = ctx.FileSystems()
 
 	if m.Root == "" {
 		m.Root = "{http.vars.root}"
@@ -294,6 +297,7 @@ func (m MatchFile) Validate() error {
 	switch m.TryPolicy {
 	case "",
 		tryPolicyFirstExist,
+		tryPolicyFirstExistFallback,
 		tryPolicyLargestSize,
 		tryPolicySmallestSize,
 		tryPolicyMostRecentlyMod:
@@ -311,12 +315,22 @@ func (m MatchFile) Validate() error {
 //   - http.matchers.file.type: file or directory
 //   - http.matchers.file.remainder: Portion remaining after splitting file path (if configured)
 func (m MatchFile) Match(r *http.Request) bool {
+	match, err := m.selectFile(r)
+	if err != nil {
+		// nolint:staticcheck
+		caddyhttp.SetVar(r.Context(), caddyhttp.MatcherErrorVarKey, err)
+	}
+	return match
+}
+
+// MatchWithError returns true if r matches m.
+func (m MatchFile) MatchWithError(r *http.Request) (bool, error) {
 	return m.selectFile(r)
 }
 
 // selectFile chooses a file according to m.TryPolicy by appending
 // the paths in m.TryFiles to m.Root, with placeholder replacements.
-func (m MatchFile) selectFile(r *http.Request) (matched bool) {
+func (m MatchFile) selectFile(r *http.Request) (bool, error) {
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 
 	root := filepath.Clean(repl.ReplaceAll(m.Root, "."))
@@ -325,8 +339,10 @@ func (m MatchFile) selectFile(r *http.Request) (matched bool) {
 
 	fileSystem, ok := m.fsmap.Get(fsName)
 	if !ok {
-		m.logger.Error("use of unregistered filesystem", zap.String("fs", fsName))
-		return false
+		if c := m.logger.Check(zapcore.ErrorLevel, "use of unregistered filesystem"); c != nil {
+			c.Write(zap.String("fs", fsName))
+		}
+		return false, nil
 	}
 	type matchCandidate struct {
 		fullpath, relative, splitRemainder string
@@ -355,7 +371,10 @@ func (m MatchFile) selectFile(r *http.Request) (matched bool) {
 			return val, nil
 		})
 		if err != nil {
-			m.logger.Error("evaluating placeholders", zap.Error(err))
+			if c := m.logger.Check(zapcore.ErrorLevel, "evaluating placeholders"); c != nil {
+				c.Write(zap.Error(err))
+			}
+
 			expandedFile = file // "oh well," I guess?
 		}
 
@@ -378,7 +397,9 @@ func (m MatchFile) selectFile(r *http.Request) (matched bool) {
 		} else {
 			globResults, err = fs.Glob(fileSystem, fullPattern)
 			if err != nil {
-				m.logger.Error("expanding glob", zap.Error(err))
+				if c := m.logger.Check(zapcore.ErrorLevel, "expanding glob"); c != nil {
+					c.Write(zap.Error(err))
+				}
 			}
 		}
 
@@ -396,13 +417,13 @@ func (m MatchFile) selectFile(r *http.Request) (matched bool) {
 	}
 
 	// setPlaceholders creates the placeholders for the matched file
-	setPlaceholders := func(candidate matchCandidate, info fs.FileInfo) {
+	setPlaceholders := func(candidate matchCandidate, isDir bool) {
 		repl.Set("http.matchers.file.relative", filepath.ToSlash(candidate.relative))
 		repl.Set("http.matchers.file.absolute", filepath.ToSlash(candidate.fullpath))
 		repl.Set("http.matchers.file.remainder", filepath.ToSlash(candidate.splitRemainder))
 
 		fileType := "file"
-		if info.IsDir() {
+		if isDir {
 			fileType = "directory"
 		}
 		repl.Set("http.matchers.file.type", fileType)
@@ -410,17 +431,32 @@ func (m MatchFile) selectFile(r *http.Request) (matched bool) {
 
 	// match file according to the configured policy
 	switch m.TryPolicy {
-	case "", tryPolicyFirstExist:
-		for _, pattern := range m.TryFiles {
+	case "", tryPolicyFirstExist, tryPolicyFirstExistFallback:
+		maxI := -1
+		if m.TryPolicy == tryPolicyFirstExistFallback {
+			maxI = len(m.TryFiles) - 1
+		}
+
+		for i, pattern := range m.TryFiles {
+			// If the pattern is a status code, emit an error,
+			// which short-circuits the middleware pipeline and
+			// writes an HTTP error response.
 			if err := parseErrorCode(pattern); err != nil {
-				caddyhttp.SetVar(r.Context(), caddyhttp.MatcherErrorVarKey, err)
-				return
+				return false, err
 			}
+
 			candidates := makeCandidates(pattern)
 			for _, c := range candidates {
+				// Skip the IO if using fallback policy and it's the latest item
+				if i == maxI {
+					setPlaceholders(c, false)
+
+					return true, nil
+				}
+
 				if info, exists := m.strictFileExists(fileSystem, c.fullpath); exists {
-					setPlaceholders(c, info)
-					return true
+					setPlaceholders(c, info.IsDir())
+					return true, nil
 				}
 			}
 		}
@@ -441,10 +477,10 @@ func (m MatchFile) selectFile(r *http.Request) (matched bool) {
 			}
 		}
 		if largestInfo == nil {
-			return false
+			return false, nil
 		}
-		setPlaceholders(largest, largestInfo)
-		return true
+		setPlaceholders(largest, largestInfo.IsDir())
+		return true, nil
 
 	case tryPolicySmallestSize:
 		var smallestSize int64
@@ -462,10 +498,10 @@ func (m MatchFile) selectFile(r *http.Request) (matched bool) {
 			}
 		}
 		if smallestInfo == nil {
-			return false
+			return false, nil
 		}
-		setPlaceholders(smallest, smallestInfo)
-		return true
+		setPlaceholders(smallest, smallestInfo.IsDir())
+		return true, nil
 
 	case tryPolicyMostRecentlyMod:
 		var recent matchCandidate
@@ -482,13 +518,13 @@ func (m MatchFile) selectFile(r *http.Request) (matched bool) {
 			}
 		}
 		if recentInfo == nil {
-			return false
+			return false, nil
 		}
-		setPlaceholders(recent, recentInfo)
-		return true
+		setPlaceholders(recent, recentInfo.IsDir())
+		return true, nil
 	}
 
-	return
+	return false, nil
 }
 
 // parseErrorCode checks if the input is a status
@@ -569,101 +605,110 @@ func indexFold(haystack, needle string) int {
 
 // isCELTryFilesLiteral returns whether the expression resolves to a map literal containing
 // only string keys with or a placeholder call.
-func isCELTryFilesLiteral(e *exprpb.Expr) bool {
-	switch e.GetExprKind().(type) {
-	case *exprpb.Expr_StructExpr:
-		structExpr := e.GetStructExpr()
-		if structExpr.GetMessageName() != "" {
-			return false
-		}
-		for _, entry := range structExpr.GetEntries() {
-			mapKey := entry.GetMapKey()
-			mapVal := entry.GetValue()
+func isCELTryFilesLiteral(e ast.Expr) bool {
+	switch e.Kind() {
+	case ast.MapKind:
+		mapExpr := e.AsMap()
+		for _, entry := range mapExpr.Entries() {
+			mapKey := entry.AsMapEntry().Key()
+			mapVal := entry.AsMapEntry().Value()
 			if !isCELStringLiteral(mapKey) {
 				return false
 			}
-			mapKeyStr := mapKey.GetConstExpr().GetStringValue()
-			if mapKeyStr == "try_files" || mapKeyStr == "split_path" {
+			mapKeyStr := mapKey.AsLiteral().ConvertToType(types.StringType).Value()
+			switch mapKeyStr {
+			case "try_files", "split_path":
 				if !isCELStringListLiteral(mapVal) {
 					return false
 				}
-			} else if mapKeyStr == "try_policy" || mapKeyStr == "root" {
+			case "try_policy", "root":
 				if !(isCELStringExpr(mapVal)) {
 					return false
 				}
-			} else {
+			default:
 				return false
 			}
 		}
 		return true
+
+	case ast.UnspecifiedExprKind, ast.CallKind, ast.ComprehensionKind, ast.IdentKind, ast.ListKind, ast.LiteralKind, ast.SelectKind, ast.StructKind:
+		// appeasing the linter :)
 	}
 	return false
 }
 
 // isCELStringExpr indicates whether the expression is a supported string expression
-func isCELStringExpr(e *exprpb.Expr) bool {
+func isCELStringExpr(e ast.Expr) bool {
 	return isCELStringLiteral(e) || isCELCaddyPlaceholderCall(e) || isCELConcatCall(e)
 }
 
 // isCELStringLiteral returns whether the expression is a CEL string literal.
-func isCELStringLiteral(e *exprpb.Expr) bool {
-	switch e.GetExprKind().(type) {
-	case *exprpb.Expr_ConstExpr:
-		constant := e.GetConstExpr()
-		switch constant.GetConstantKind().(type) {
-		case *exprpb.Constant_StringValue:
+func isCELStringLiteral(e ast.Expr) bool {
+	switch e.Kind() {
+	case ast.LiteralKind:
+		constant := e.AsLiteral()
+		switch constant.Type() {
+		case types.StringType:
 			return true
 		}
+	case ast.UnspecifiedExprKind, ast.CallKind, ast.ComprehensionKind, ast.IdentKind, ast.ListKind, ast.MapKind, ast.SelectKind, ast.StructKind:
+		// appeasing the linter :)
 	}
 	return false
 }
 
 // isCELCaddyPlaceholderCall returns whether the expression is a caddy placeholder call.
-func isCELCaddyPlaceholderCall(e *exprpb.Expr) bool {
-	switch e.GetExprKind().(type) {
-	case *exprpb.Expr_CallExpr:
-		call := e.GetCallExpr()
-		if call.GetFunction() == "caddyPlaceholder" {
+func isCELCaddyPlaceholderCall(e ast.Expr) bool {
+	switch e.Kind() {
+	case ast.CallKind:
+		call := e.AsCall()
+		if call.FunctionName() == caddyhttp.CELPlaceholderFuncName {
 			return true
 		}
+	case ast.UnspecifiedExprKind, ast.ComprehensionKind, ast.IdentKind, ast.ListKind, ast.LiteralKind, ast.MapKind, ast.SelectKind, ast.StructKind:
+		// appeasing the linter :)
 	}
 	return false
 }
 
 // isCELConcatCall tests whether the expression is a concat function (+) with string, placeholder, or
 // other concat call arguments.
-func isCELConcatCall(e *exprpb.Expr) bool {
-	switch e.GetExprKind().(type) {
-	case *exprpb.Expr_CallExpr:
-		call := e.GetCallExpr()
-		if call.GetTarget() != nil {
+func isCELConcatCall(e ast.Expr) bool {
+	switch e.Kind() {
+	case ast.CallKind:
+		call := e.AsCall()
+		if call.Target().Kind() != ast.UnspecifiedExprKind {
 			return false
 		}
-		if call.GetFunction() != operators.Add {
+		if call.FunctionName() != operators.Add {
 			return false
 		}
-		for _, arg := range call.GetArgs() {
+		for _, arg := range call.Args() {
 			if !isCELStringExpr(arg) {
 				return false
 			}
 		}
 		return true
+	case ast.UnspecifiedExprKind, ast.ComprehensionKind, ast.IdentKind, ast.ListKind, ast.LiteralKind, ast.MapKind, ast.SelectKind, ast.StructKind:
+		// appeasing the linter :)
 	}
 	return false
 }
 
 // isCELStringListLiteral returns whether the expression resolves to a list literal
 // containing only string constants or a placeholder call.
-func isCELStringListLiteral(e *exprpb.Expr) bool {
-	switch e.GetExprKind().(type) {
-	case *exprpb.Expr_ListExpr:
-		list := e.GetListExpr()
-		for _, elem := range list.GetElements() {
+func isCELStringListLiteral(e ast.Expr) bool {
+	switch e.Kind() {
+	case ast.ListKind:
+		list := e.AsList()
+		for _, elem := range list.Elements() {
 			if !isCELStringExpr(elem) {
 				return false
 			}
 		}
 		return true
+	case ast.UnspecifiedExprKind, ast.CallKind, ast.ComprehensionKind, ast.IdentKind, ast.LiteralKind, ast.MapKind, ast.SelectKind, ast.StructKind:
+		// appeasing the linter :)
 	}
 	return false
 }
@@ -678,15 +723,16 @@ var globSafeRepl = strings.NewReplacer(
 )
 
 const (
-	tryPolicyFirstExist      = "first_exist"
-	tryPolicyLargestSize     = "largest_size"
-	tryPolicySmallestSize    = "smallest_size"
-	tryPolicyMostRecentlyMod = "most_recently_modified"
+	tryPolicyFirstExist         = "first_exist"
+	tryPolicyFirstExistFallback = "first_exist_fallback"
+	tryPolicyLargestSize        = "largest_size"
+	tryPolicySmallestSize       = "smallest_size"
+	tryPolicyMostRecentlyMod    = "most_recently_modified"
 )
 
 // Interface guards
 var (
-	_ caddy.Validator              = (*MatchFile)(nil)
-	_ caddyhttp.RequestMatcher     = (*MatchFile)(nil)
-	_ caddyhttp.CELLibraryProducer = (*MatchFile)(nil)
+	_ caddy.Validator                   = (*MatchFile)(nil)
+	_ caddyhttp.RequestMatcherWithError = (*MatchFile)(nil)
+	_ caddyhttp.CELLibraryProducer      = (*MatchFile)(nil)
 )

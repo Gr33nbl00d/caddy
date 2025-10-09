@@ -50,8 +50,11 @@ func (a *adminAPI) Provision(ctx caddy.Context) error {
 	a.ctx = ctx
 	a.log = ctx.Logger(a) // TODO: passing in 'a' is a hack until the admin API is officially extensible (see #5032)
 
-	// Avoid initializing PKI if it wasn't configured
-	if pkiApp := a.ctx.AppIfConfigured("pki"); pkiApp != nil {
+	// Avoid initializing PKI if it wasn't configured.
+	// We intentionally ignore the error since it's not
+	// fatal if the PKI app is not explicitly configured.
+	pkiApp, err := ctx.AppIfConfigured("pki")
+	if err == nil {
 		a.pkiApp = pkiApp.(*PKI)
 	}
 
@@ -217,13 +220,13 @@ func (a *adminAPI) getCAFromAPIRequestPath(r *http.Request) (*CA, error) {
 func rootAndIntermediatePEM(ca *CA) (root, inter []byte, err error) {
 	root, err = pemEncodeCert(ca.RootCertificate().Raw)
 	if err != nil {
-		return
+		return root, inter, err
 	}
 	inter, err = pemEncodeCert(ca.IntermediateCertificate().Raw)
 	if err != nil {
-		return
+		return root, inter, err
 	}
-	return
+	return root, inter, err
 }
 
 // caInfo is the response structure for the CA info API endpoint.

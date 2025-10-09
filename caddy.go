@@ -81,13 +81,17 @@ type Config struct {
 	// associated value.
 	AppsRaw ModuleMap `json:"apps,omitempty" caddy:"namespace="`
 
-	apps    map[string]App
-	storage certmagic.Storage
+	apps map[string]App
+
+	// failedApps is a map of apps that failed to provision with their underlying error.
+	failedApps   map[string]error
+	storage      certmagic.Storage
+	eventEmitter eventEmitter
 
 	cancelFunc context.CancelFunc
 
-	// filesystems is a dict of filesystems that will later be loaded from and added to.
-	filesystems FileSystems
+	// fileSystems is a dict of fileSystems that will later be loaded from and added to.
+	fileSystems FileSystems
 }
 
 // App is a thing that Caddy runs.
@@ -397,6 +401,78 @@ func unsyncedDecodeAndRun(cfgJSON []byte, allowPersist bool) error {
 // will want to use Run instead, which also
 // updates the config's raw state.
 func run(newCfg *Config, start bool) (Context, error) {
+	ctx, err := provisionContext(newCfg, start)
+	if err != nil {
+		globalMetrics.configSuccess.Set(0)
+		return ctx, err
+	}
+
+	if !start {
+		return ctx, nil
+	}
+
+	defer func() {
+		// if newCfg fails to start completely, clean up the already provisioned modules
+		// partially copied from provisionContext
+		if err != nil {
+			globalMetrics.configSuccess.Set(0)
+			ctx.cfg.cancelFunc()
+
+			if currentCtx.cfg != nil {
+				certmagic.Default.Storage = currentCtx.cfg.storage
+			}
+		}
+	}()
+
+	// Provision any admin routers which may need to access
+	// some of the other apps at runtime
+	err = ctx.cfg.Admin.provisionAdminRouters(ctx)
+	if err != nil {
+		return ctx, err
+	}
+
+	// Start
+	err = func() error {
+		started := make([]string, 0, len(ctx.cfg.apps))
+		for name, a := range ctx.cfg.apps {
+			err := a.Start()
+			if err != nil {
+				// an app failed to start, so we need to stop
+				// all other apps that were already started
+				for _, otherAppName := range started {
+					err2 := ctx.cfg.apps[otherAppName].Stop()
+					if err2 != nil {
+						err = fmt.Errorf("%v; additionally, aborting app %s: %v",
+							err, otherAppName, err2)
+					}
+				}
+				return fmt.Errorf("%s app module: start: %v", name, err)
+			}
+			started = append(started, name)
+		}
+		return nil
+	}()
+	if err != nil {
+		return ctx, err
+	}
+	globalMetrics.configSuccess.Set(1)
+	globalMetrics.configSuccessTime.SetToCurrentTime()
+
+	// TODO: This event is experimental and subject to change.
+	ctx.emitEvent("started", nil)
+
+	// now that the user's config is running, finish setting up anything else,
+	// such as remote admin endpoint, config loader, etc.
+	err = finishSettingUp(ctx, ctx.cfg)
+	return ctx, err
+}
+
+// provisionContext creates a new context from the given configuration and provisions
+// storage and apps.
+// If `newCfg` is nil a new empty configuration will be created.
+// If `replaceAdminServer` is true any currently active admin server will be replaced
+// with a new admin server based on the provided configuration.
+func provisionContext(newCfg *Config, replaceAdminServer bool) (Context, error) {
 	// because we will need to roll back any state
 	// modifications if this function errors, we
 	// keep a single error value and scope all
@@ -419,6 +495,7 @@ func run(newCfg *Config, start bool) (Context, error) {
 	ctx, cancel := NewContext(Context{Context: context.Background(), cfg: newCfg})
 	defer func() {
 		if err != nil {
+			globalMetrics.configSuccess.Set(0)
 			// if there were any errors during startup,
 			// we should cancel the new context we created
 			// since the associated config won't be used;
@@ -443,19 +520,12 @@ func run(newCfg *Config, start bool) (Context, error) {
 		return ctx, err
 	}
 
-	// start the admin endpoint (and stop any prior one)
-	if start {
-		err = replaceLocalAdminServer(newCfg)
-		if err != nil {
-			return ctx, fmt.Errorf("starting caddy administration endpoint: %v", err)
-		}
-	}
-
 	// create the new filesystem map
-	newCfg.filesystems = &filesystems.FilesystemMap{}
+	newCfg.fileSystems = &filesystems.FileSystemMap{}
 
 	// prepare the new config for use
 	newCfg.apps = make(map[string]App)
+	newCfg.failedApps = make(map[string]error)
 
 	// set up global storage and make it CertMagic's default storage, too
 	err = func() error {
@@ -482,6 +552,14 @@ func run(newCfg *Config, start bool) (Context, error) {
 		return ctx, err
 	}
 
+	// start the admin endpoint (and stop any prior one)
+	if replaceAdminServer {
+		err = replaceLocalAdminServer(newCfg, ctx)
+		if err != nil {
+			return ctx, fmt.Errorf("starting caddy administration endpoint: %v", err)
+		}
+	}
+
 	// Load and Provision each app and their submodules
 	err = func() error {
 		for appName := range newCfg.AppsRaw {
@@ -491,49 +569,16 @@ func run(newCfg *Config, start bool) (Context, error) {
 		}
 		return nil
 	}()
-	if err != nil {
-		return ctx, err
-	}
+	return ctx, err
+}
 
-	if !start {
-		return ctx, nil
-	}
-
-	// Provision any admin routers which may need to access
-	// some of the other apps at runtime
-	err = newCfg.Admin.provisionAdminRouters(ctx)
-	if err != nil {
-		return ctx, err
-	}
-
-	// Start
-	err = func() error {
-		started := make([]string, 0, len(newCfg.apps))
-		for name, a := range newCfg.apps {
-			err := a.Start()
-			if err != nil {
-				// an app failed to start, so we need to stop
-				// all other apps that were already started
-				for _, otherAppName := range started {
-					err2 := newCfg.apps[otherAppName].Stop()
-					if err2 != nil {
-						err = fmt.Errorf("%v; additionally, aborting app %s: %v",
-							err, otherAppName, err2)
-					}
-				}
-				return fmt.Errorf("%s app module: start: %v", name, err)
-			}
-			started = append(started, name)
-		}
-		return nil
-	}()
-	if err != nil {
-		return ctx, err
-	}
-
-	// now that the user's config is running, finish setting up anything else,
-	// such as remote admin endpoint, config loader, etc.
-	return ctx, finishSettingUp(ctx, newCfg)
+// ProvisionContext creates a new context from the configuration and provisions storage
+// and app modules.
+// The function is intended for testing and advanced use cases only, typically `Run` should be
+// use to ensure a fully functional caddy instance.
+// EXPERIMENTAL: While this is public the interface and implementation details of this function may change.
+func ProvisionContext(newCfg *Config) (Context, error) {
+	return provisionContext(newCfg, false)
 }
 
 // finishSettingUp should be run after all apps have successfully started.
@@ -672,6 +717,9 @@ func unsyncedStop(ctx Context) {
 		return
 	}
 
+	// TODO: This event is experimental and subject to change.
+	ctx.emitEvent("stopping", nil)
+
 	// stop each app
 	for name, a := range ctx.cfg.apps {
 		err := a.Stop()
@@ -701,8 +749,10 @@ func Validate(cfg *Config) error {
 // Errors are logged along the way, and an appropriate exit
 // code is emitted.
 func exitProcess(ctx context.Context, logger *zap.Logger) {
-	// let the rest of the program know we're quitting
-	atomic.StoreInt32(exiting, 1)
+	// let the rest of the program know we're quitting; only do it once
+	if !atomic.CompareAndSwapInt32(exiting, 0, 1) {
+		return
+	}
 
 	// give the OS or service/process manager our 2 weeks' notice: we quit
 	if err := notify.Stopping(); err != nil {
@@ -715,6 +765,7 @@ func exitProcess(ctx context.Context, logger *zap.Logger) {
 	logger.Warn("exiting; byeee!! 👋")
 
 	exitCode := ExitCodeSuccess
+	lastContext := ActiveContext()
 
 	// stop all apps
 	if err := Stop(); err != nil {
@@ -735,6 +786,16 @@ func exitProcess(ctx context.Context, logger *zap.Logger) {
 			exitCode = ExitCodeFailedQuit
 		}
 	}
+
+	// execute any process-exit callbacks
+	for _, exitFunc := range lastContext.exitFuncs {
+		exitFunc(ctx)
+	}
+	exitFuncsMu.Lock()
+	for _, exitFunc := range exitFuncs {
+		exitFunc(ctx)
+	}
+	exitFuncsMu.Unlock()
 
 	// shut down admin endpoint(s) in goroutines so that
 	// if this function was called from an admin handler,
@@ -773,6 +834,23 @@ var exiting = new(int32) // accessed atomically
 // Exiting returns true if the process is exiting.
 // EXPERIMENTAL API: subject to change or removal.
 func Exiting() bool { return atomic.LoadInt32(exiting) == 1 }
+
+// OnExit registers a callback to invoke during process exit.
+// This registration is PROCESS-GLOBAL, meaning that each
+// function should only be registered once forever, NOT once
+// per config load (etc).
+//
+// EXPERIMENTAL API: subject to change or removal.
+func OnExit(f func(context.Context)) {
+	exitFuncsMu.Lock()
+	exitFuncs = append(exitFuncs, f)
+	exitFuncsMu.Unlock()
+}
+
+var (
+	exitFuncs   []func(context.Context)
+	exitFuncsMu sync.Mutex
+)
 
 // Duration can be an integer or a string. An integer is
 // interpreted as nanoseconds. If a string, it is a Go
@@ -841,7 +919,7 @@ func InstanceID() (uuid.UUID, error) {
 		if err != nil {
 			return uuid, err
 		}
-		err = os.MkdirAll(appDataDir, 0o600)
+		err = os.MkdirAll(appDataDir, 0o700)
 		if err != nil {
 			return uuid, err
 		}
@@ -897,11 +975,11 @@ func Version() (simple, full string) {
 		if CustomVersion != "" {
 			full = CustomVersion
 			simple = CustomVersion
-			return
+			return simple, full
 		}
 		full = "unknown"
 		simple = "unknown"
-		return
+		return simple, full
 	}
 	// find the Caddy module in the dependency list
 	for _, dep := range bi.Deps {
@@ -981,8 +1059,100 @@ func Version() (simple, full string) {
 		}
 	}
 
-	return
+	return simple, full
 }
+
+// Event represents something that has happened or is happening.
+// An Event value is not synchronized, so it should be copied if
+// being used in goroutines.
+//
+// EXPERIMENTAL: Events are subject to change.
+type Event struct {
+	// If non-nil, the event has been aborted, meaning
+	// propagation has stopped to other handlers and
+	// the code should stop what it was doing. Emitters
+	// may choose to use this as a signal to adjust their
+	// code path appropriately.
+	Aborted error
+
+	// The data associated with the event. Usually the
+	// original emitter will be the only one to set or
+	// change these values, but the field is exported
+	// so handlers can have full access if needed.
+	// However, this map is not synchronized, so
+	// handlers must not use this map directly in new
+	// goroutines; instead, copy the map to use it in a
+	// goroutine. Data may be nil.
+	Data map[string]any
+
+	id     uuid.UUID
+	ts     time.Time
+	name   string
+	origin Module
+}
+
+// NewEvent creates a new event, but does not emit the event. To emit an
+// event, call Emit() on the current instance of the caddyevents app insteaad.
+//
+// EXPERIMENTAL: Subject to change.
+func NewEvent(ctx Context, name string, data map[string]any) (Event, error) {
+	id, err := uuid.NewRandom()
+	if err != nil {
+		return Event{}, fmt.Errorf("generating new event ID: %v", err)
+	}
+	name = strings.ToLower(name)
+	return Event{
+		Data:   data,
+		id:     id,
+		ts:     time.Now(),
+		name:   name,
+		origin: ctx.Module(),
+	}, nil
+}
+
+func (e Event) ID() uuid.UUID        { return e.id }
+func (e Event) Timestamp() time.Time { return e.ts }
+func (e Event) Name() string         { return e.name }
+func (e Event) Origin() Module       { return e.origin } // Returns the module that originated the event. May be nil, usually if caddy core emits the event.
+
+// CloudEvent exports event e as a structure that, when
+// serialized as JSON, is compatible with the
+// CloudEvents spec.
+func (e Event) CloudEvent() CloudEvent {
+	dataJSON, _ := json.Marshal(e.Data)
+	var source string
+	if e.Origin() == nil {
+		source = "caddy"
+	} else {
+		source = string(e.Origin().CaddyModule().ID)
+	}
+	return CloudEvent{
+		ID:              e.id.String(),
+		Source:          source,
+		SpecVersion:     "1.0",
+		Type:            e.name,
+		Time:            e.ts,
+		DataContentType: "application/json",
+		Data:            dataJSON,
+	}
+}
+
+// CloudEvent is a JSON-serializable structure that
+// is compatible with the CloudEvents specification.
+// See https://cloudevents.io.
+// EXPERIMENTAL: Subject to change.
+type CloudEvent struct {
+	ID              string          `json:"id"`
+	Source          string          `json:"source"`
+	SpecVersion     string          `json:"specversion"`
+	Type            string          `json:"type"`
+	Time            time.Time       `json:"time"`
+	DataContentType string          `json:"datacontenttype,omitempty"`
+	Data            json.RawMessage `json:"data,omitempty"`
+}
+
+// ErrEventAborted cancels an event.
+var ErrEventAborted = errors.New("event aborted")
 
 // ActiveContext returns the currently-active context.
 // This function is experimental and might be changed
@@ -1026,6 +1196,91 @@ var (
 	// essentially synchronizes config changes/reloads.
 	rawCfgMu sync.RWMutex
 )
+
+// lastConfigFile and lastConfigAdapter remember the source config
+// file and adapter used when Caddy was started via the CLI "run" command.
+// These are consulted by the SIGUSR1 handler to attempt reloading from
+// the same source. They are intentionally not set for other entrypoints
+// such as "caddy start" or subcommands like file-server.
+var (
+	lastConfigMu      sync.RWMutex
+	lastConfigFile    string
+	lastConfigAdapter string
+)
+
+// reloadFromSourceFunc is the type of stored callback
+// which is called when we receive a SIGUSR1 signal.
+type reloadFromSourceFunc func(file, adapter string) error
+
+// reloadFromSourceCallback is the stored callback
+// which is called when we receive a SIGUSR1 signal.
+var reloadFromSourceCallback reloadFromSourceFunc
+
+// errReloadFromSourceUnavailable is returned when no reload-from-source callback is set.
+var errReloadFromSourceUnavailable = errors.New("reload from source unavailable in this process") //nolint:unused
+
+// SetLastConfig records the given source file and adapter as the
+// last-known external configuration source. Intended to be called
+// only when starting via "caddy run --config <file> --adapter <adapter>".
+func SetLastConfig(file, adapter string, fn reloadFromSourceFunc) {
+	lastConfigMu.Lock()
+	lastConfigFile = file
+	lastConfigAdapter = adapter
+	reloadFromSourceCallback = fn
+	lastConfigMu.Unlock()
+}
+
+// ClearLastConfigIfDifferent clears the recorded last-config if the provided
+// source file/adapter do not match the recorded last-config. If both srcFile
+// and srcAdapter are empty, the last-config is cleared.
+func ClearLastConfigIfDifferent(srcFile, srcAdapter string) {
+	if (srcFile != "" || srcAdapter != "") && lastConfigMatches(srcFile, srcAdapter) {
+		return
+	}
+	SetLastConfig("", "", nil)
+}
+
+// getLastConfig returns the last-known config file and adapter.
+func getLastConfig() (file, adapter string, fn reloadFromSourceFunc) {
+	lastConfigMu.RLock()
+	f, a, cb := lastConfigFile, lastConfigAdapter, reloadFromSourceCallback
+	lastConfigMu.RUnlock()
+	return f, a, cb
+}
+
+// lastConfigMatches returns true if the provided source file and/or adapter
+// matches the recorded last-config. Matching rules (in priority order):
+//  1. If srcAdapter is provided and differs from the recorded adapter, no match.
+//  2. If srcFile exactly equals the recorded file, match.
+//  3. If both sides can be made absolute and equal, match.
+//  4. If basenames are equal, match.
+func lastConfigMatches(srcFile, srcAdapter string) bool {
+	lf, la, _ := getLastConfig()
+
+	// If adapter is provided, it must match.
+	if srcAdapter != "" && srcAdapter != la {
+		return false
+	}
+
+	// Quick equality check.
+	if srcFile == lf {
+		return true
+	}
+
+	// Try absolute path comparison.
+	sAbs, sErr := filepath.Abs(srcFile)
+	lAbs, lErr := filepath.Abs(lf)
+	if sErr == nil && lErr == nil && sAbs == lAbs {
+		return true
+	}
+
+	// Final fallback: basename equality.
+	if filepath.Base(srcFile) == filepath.Base(lf) {
+		return true
+	}
+
+	return false
+}
 
 // errSameConfig is returned if the new config is the same
 // as the old one. This isn't usually an actual, actionable

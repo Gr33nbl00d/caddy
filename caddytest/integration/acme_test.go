@@ -5,25 +5,24 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/tls"
-	"crypto/x509"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/caddyserver/caddy/v2"
-	"github.com/caddyserver/caddy/v2/caddytest"
-	"github.com/mholt/acmez"
-	"github.com/mholt/acmez/acme"
+	"github.com/mholt/acmez/v3"
+	"github.com/mholt/acmez/v3/acme"
 	smallstepacme "github.com/smallstep/certificates/acme"
 	"go.uber.org/zap"
+	"go.uber.org/zap/exp/zapslog"
+
+	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/caddytest"
 )
 
-const acmeChallengePort = 8080
+const acmeChallengePort = 9081
 
 // Test the basic functionality of Caddy's ACME server
 func TestACMEServerWithDefaults(t *testing.T) {
@@ -48,37 +47,11 @@ func TestACMEServerWithDefaults(t *testing.T) {
 	}
   `, "caddyfile")
 
-	datadir := caddy.AppDataDir()
-	rootCertsGlob := filepath.Join(datadir, "pki", "authorities", "local", "*.crt")
-	matches, err := filepath.Glob(rootCertsGlob)
-	if err != nil {
-		t.Errorf("could not find root certs: %s", err)
-		return
-	}
-	certPool := x509.NewCertPool()
-	for _, m := range matches {
-		certPem, err := os.ReadFile(m)
-		if err != nil {
-			t.Errorf("reading cert file '%s' error: %s", m, err)
-			return
-		}
-		if !certPool.AppendCertsFromPEM(certPem) {
-			t.Errorf("failed to append the cert: %s", m)
-			return
-		}
-	}
-
 	client := acmez.Client{
 		Client: &acme.Client{
-			Directory: "https://acme.localhost:9443/acme/local/directory",
-			HTTPClient: &http.Client{
-				Transport: &http.Transport{
-					TLSClientConfig: &tls.Config{
-						RootCAs: certPool,
-					},
-				},
-			},
-			Logger: logger,
+			Directory:  "https://acme.localhost:9443/acme/local/directory",
+			HTTPClient: tester.Client,
+			Logger:     slog.New(zapslog.NewHandler(logger.Core())),
 		},
 		ChallengeSolvers: map[string]acmez.Solver{
 			acme.ChallengeTypeHTTP01: &naiveHTTPSolver{logger: logger},
@@ -107,7 +80,7 @@ func TestACMEServerWithDefaults(t *testing.T) {
 		return
 	}
 
-	certs, err := client.ObtainCertificate(ctx, account, certPrivateKey, []string{"localhost"})
+	certs, err := client.ObtainCertificateForSANs(ctx, account, certPrivateKey, []string{"localhost"})
 	if err != nil {
 		t.Errorf("obtaining certificate: %v", err)
 		return
@@ -143,37 +116,11 @@ func TestACMEServerWithMismatchedChallenges(t *testing.T) {
 	}
   `, "caddyfile")
 
-	datadir := caddy.AppDataDir()
-	rootCertsGlob := filepath.Join(datadir, "pki", "authorities", "local", "*.crt")
-	matches, err := filepath.Glob(rootCertsGlob)
-	if err != nil {
-		t.Errorf("could not find root certs: %s", err)
-		return
-	}
-	certPool := x509.NewCertPool()
-	for _, m := range matches {
-		certPem, err := os.ReadFile(m)
-		if err != nil {
-			t.Errorf("reading cert file '%s' error: %s", m, err)
-			return
-		}
-		if !certPool.AppendCertsFromPEM(certPem) {
-			t.Errorf("failed to append the cert: %s", m)
-			return
-		}
-	}
-
 	client := acmez.Client{
 		Client: &acme.Client{
-			Directory: "https://acme.localhost:9443/acme/local/directory",
-			HTTPClient: &http.Client{
-				Transport: &http.Transport{
-					TLSClientConfig: &tls.Config{
-						RootCAs: certPool,
-					},
-				},
-			},
-			Logger: logger,
+			Directory:  "https://acme.localhost:9443/acme/local/directory",
+			HTTPClient: tester.Client,
+			Logger:     slog.New(zapslog.NewHandler(logger.Core())),
 		},
 		ChallengeSolvers: map[string]acmez.Solver{
 			acme.ChallengeTypeHTTP01: &naiveHTTPSolver{logger: logger},
@@ -202,7 +149,7 @@ func TestACMEServerWithMismatchedChallenges(t *testing.T) {
 		return
 	}
 
-	certs, err := client.ObtainCertificate(ctx, account, certPrivateKey, []string{"localhost"})
+	certs, err := client.ObtainCertificateForSANs(ctx, account, certPrivateKey, []string{"localhost"})
 	if len(certs) > 0 {
 		t.Errorf("expected '0' certificates, but received '%d'", len(certs))
 	}
@@ -224,12 +171,13 @@ type naiveHTTPSolver struct {
 func (s *naiveHTTPSolver) Present(ctx context.Context, challenge acme.Challenge) error {
 	smallstepacme.InsecurePortHTTP01 = acmeChallengePort
 	s.srv = &http.Server{
-		Addr: fmt.Sprintf("localhost:%d", acmeChallengePort),
+		Addr: fmt.Sprintf(":%d", acmeChallengePort),
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			host, _, err := net.SplitHostPort(r.Host)
 			if err != nil {
 				host = r.Host
 			}
+			s.logger.Info("received request on challenge server", zap.String("path", r.URL.Path))
 			if r.Method == "GET" && r.URL.Path == challenge.HTTP01ResourcePath() && strings.EqualFold(host, challenge.Identifier.Value) {
 				w.Header().Add("Content-Type", "text/plain")
 				w.Write([]byte(challenge.KeyAuthorization))

@@ -169,6 +169,27 @@ func (IPMaskFilter) CaddyModule() caddy.ModuleInfo {
 // UnmarshalCaddyfile sets up the module from Caddyfile tokens.
 func (m *IPMaskFilter) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	d.Next() // consume filter name
+
+	args := d.RemainingArgs()
+	if len(args) > 2 {
+		return d.Errf("too many arguments")
+	}
+	if len(args) > 0 {
+		val, err := strconv.Atoi(args[0])
+		if err != nil {
+			return d.Errf("error parsing %s: %v", args[0], err)
+		}
+		m.IPv4MaskRaw = val
+
+		if len(args) > 1 {
+			val, err := strconv.Atoi(args[1])
+			if err != nil {
+				return d.Errf("error parsing %s: %v", args[1], err)
+			}
+			m.IPv6MaskRaw = val
+		}
+	}
+
 	for d.NextBlock(0) {
 		switch d.Val() {
 		case "ipv4":
@@ -234,7 +255,7 @@ func (m IPMaskFilter) Filter(in zapcore.Field) zapcore.Field {
 
 func (m IPMaskFilter) mask(s string) string {
 	output := ""
-	for _, value := range strings.Split(s, ",") {
+	for value := range strings.SplitSeq(s, ",") {
 		value = strings.TrimSpace(value)
 		host, port, err := net.SplitHostPort(value)
 		if err != nil {

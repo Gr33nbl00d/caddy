@@ -119,11 +119,46 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				return port, true
 			case "http.request.hostport":
 				return req.Host, true
+			case "http.request.local":
+				localAddr, _ := req.Context().Value(http.LocalAddrContextKey).(net.Addr)
+				return localAddr.String(), true
+			case "http.request.local.host":
+				localAddr, _ := req.Context().Value(http.LocalAddrContextKey).(net.Addr)
+				host, _, err := net.SplitHostPort(localAddr.String())
+				if err != nil {
+					// localAddr is host:port for tcp and udp sockets and /unix/socket.path
+					// for unix sockets. net.SplitHostPort only operates on tcp and udp sockets,
+					// not unix sockets and will fail with the latter.
+					// We assume when net.SplitHostPort fails, localAddr is a unix socket and thus
+					// already "split" and save to return.
+					return localAddr, true
+				}
+				return host, true
+			case "http.request.local.port":
+				localAddr, _ := req.Context().Value(http.LocalAddrContextKey).(net.Addr)
+				_, port, _ := net.SplitHostPort(localAddr.String())
+				if portNum, err := strconv.Atoi(port); err == nil {
+					return portNum, true
+				}
+				return port, true
 			case "http.request.remote":
+				if req.TLS != nil && !req.TLS.HandshakeComplete {
+					// without a complete handshake (QUIC "early data") we can't trust the remote IP address to not be spoofed
+					return nil, true
+				}
 				return req.RemoteAddr, true
 			case "http.request.remote.host":
+				if req.TLS != nil && !req.TLS.HandshakeComplete {
+					// without a complete handshake (QUIC "early data") we can't trust the remote IP address to not be spoofed
+					return nil, true
+				}
 				host, _, err := net.SplitHostPort(req.RemoteAddr)
 				if err != nil {
+					// req.RemoteAddr is host:port for tcp and udp sockets and /unix/socket.path
+					// for unix sockets. net.SplitHostPort only operates on tcp and udp sockets,
+					// not unix sockets and will fail with the latter.
+					// We assume when net.SplitHostPort fails, req.RemoteAddr is a unix socket
+					// and thus already "split" and save to return.
 					return req.RemoteAddr, true
 				}
 				return host, true
@@ -137,8 +172,12 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 			// current URI, including any internal rewrites
 			case "http.request.uri":
 				return req.URL.RequestURI(), true
+			case "http.request.uri_escaped":
+				return url.QueryEscape(req.URL.RequestURI()), true
 			case "http.request.uri.path":
 				return req.URL.Path, true
+			case "http.request.uri.path_escaped":
+				return url.QueryEscape(req.URL.Path), true
 			case "http.request.uri.path.file":
 				_, file := path.Split(req.URL.Path)
 				return file, true
@@ -151,6 +190,13 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				return path.Ext(req.URL.Path), true
 			case "http.request.uri.query":
 				return req.URL.RawQuery, true
+			case "http.request.uri.query_escaped":
+				return url.QueryEscape(req.URL.RawQuery), true
+			case "http.request.uri.prefixed_query":
+				if req.URL.RawQuery == "" {
+					return "", true
+				}
+				return "?" + req.URL.RawQuery, true
 			case "http.request.duration":
 				start := GetVar(req.Context(), "start_time").(time.Time)
 				return time.Since(start), true
@@ -204,6 +250,12 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 			case "http.request.orig_uri.query":
 				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
 				return or.URL.RawQuery, true
+			case "http.request.orig_uri.prefixed_query":
+				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
+				if or.URL.RawQuery == "" {
+					return "", true
+				}
+				return "?" + or.URL.RawQuery, true
 			}
 
 			// remote IP range/prefix (e.g. keep top 24 bits of 1.2.3.4  => "1.2.3.0/24")
@@ -237,7 +289,7 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				return prefix.String(), true
 			}
 
-			// hostname labels
+			// hostname labels (case insensitive, so normalize to lowercase)
 			if strings.HasPrefix(key, reqHostLabelsReplPrefix) {
 				idxStr := key[len(reqHostLabelsReplPrefix):]
 				idx, err := strconv.Atoi(idxStr)
@@ -252,7 +304,7 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				if idx >= len(hostLabels) {
 					return "", true
 				}
-				return hostLabels[len(hostLabels)-idx-1], true
+				return strings.ToLower(hostLabels[len(hostLabels)-idx-1]), true
 			}
 
 			// path parts
@@ -317,13 +369,13 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 			}
 		}
 
-		switch {
-		case key == "http.shutting_down":
+		switch key {
+		case "http.shutting_down":
 			server := req.Context().Value(ServerCtxKey).(*Server)
 			server.shutdownAtMu.RLock()
 			defer server.shutdownAtMu.RUnlock()
 			return !server.shutdownAt.IsZero(), true
-		case key == "http.time_until_shutdown":
+		case "http.time_until_shutdown":
 			server := req.Context().Value(ServerCtxKey).(*Server)
 			server.shutdownAtMu.RLock()
 			defer server.shutdownAtMu.RUnlock()

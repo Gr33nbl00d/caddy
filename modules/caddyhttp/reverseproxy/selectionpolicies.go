@@ -20,13 +20,15 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"hash/fnv"
 	weakrand "math/rand"
 	"net"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
+
+	"github.com/cespare/xxhash/v2"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig"
@@ -109,8 +111,8 @@ func (r *WeightedRoundRobinSelection) UnmarshalCaddyfile(d *caddyfile.Dispenser)
 		if err != nil {
 			return d.Errf("invalid weight value '%s': %v", weight, err)
 		}
-		if weightInt < 1 {
-			return d.Errf("invalid weight value '%s': weight should be non-zero and positive", weight)
+		if weightInt < 0 {
+			return d.Errf("invalid weight value '%s': weight should be non-negative", weight)
 		}
 		r.Weights = append(r.Weights, weightInt)
 	}
@@ -134,8 +136,15 @@ func (r *WeightedRoundRobinSelection) Select(pool UpstreamPool, _ *http.Request,
 		return pool[0]
 	}
 	var index, totalWeight int
+	var weights []int
+
+	for _, w := range r.Weights {
+		if w > 0 {
+			weights = append(weights, w)
+		}
+	}
 	currentWeight := int(atomic.AddUint32(&r.index, 1)) % r.totalWeight
-	for i, weight := range r.Weights {
+	for i, weight := range weights {
 		totalWeight += weight
 		if currentWeight < totalWeight {
 			index = i
@@ -143,9 +152,9 @@ func (r *WeightedRoundRobinSelection) Select(pool UpstreamPool, _ *http.Request,
 		}
 	}
 
-	upstreams := make([]*Upstream, 0, len(r.Weights))
-	for _, upstream := range pool {
-		if !upstream.Available() {
+	upstreams := make([]*Upstream, 0, len(weights))
+	for i, upstream := range pool {
+		if !upstream.Available() || r.Weights[i] == 0 {
 			continue
 		}
 		upstreams = append(upstreams, upstream)
@@ -210,10 +219,7 @@ func (r RandomChoiceSelection) Validate() error {
 
 // Select returns an available host, if any.
 func (r RandomChoiceSelection) Select(pool UpstreamPool, _ *http.Request, _ http.ResponseWriter) *Upstream {
-	k := r.Choose
-	if k > len(pool) {
-		k = len(pool)
-	}
+	k := min(r.Choose, len(pool))
 	choices := make([]*Upstream, k)
 	for i, upstream := range pool {
 		if !upstream.Available() {
@@ -612,6 +618,8 @@ type CookieHashSelection struct {
 	Name string `json:"name,omitempty"`
 	// Secret to hash (Hmac256) chosen upstream in cookie
 	Secret string `json:"secret,omitempty"`
+	// The cookie's Max-Age before it expires. Default is no expiry.
+	MaxAge caddy.Duration `json:"max_age,omitempty"`
 
 	// The fallback policy to use if the cookie is not present. Defaults to `random`.
 	FallbackRaw json.RawMessage `json:"fallback,omitempty" caddy:"namespace=http.reverse_proxy.selection_policies inline_key=policy"`
@@ -655,12 +663,25 @@ func (s CookieHashSelection) Select(pool UpstreamPool, req *http.Request, w http
 		if err != nil {
 			return upstream
 		}
-		http.SetCookie(w, &http.Cookie{
+		cookie := &http.Cookie{
 			Name:   s.Name,
 			Value:  sha,
 			Path:   "/",
 			Secure: false,
-		})
+		}
+		isProxyHttps := false
+		if trusted, ok := caddyhttp.GetVar(req.Context(), caddyhttp.TrustedProxyVarKey).(bool); ok && trusted {
+			xfp, xfpOk, _ := lastHeaderValue(req.Header, "X-Forwarded-Proto")
+			isProxyHttps = xfpOk && xfp == "https"
+		}
+		if req.TLS != nil || isProxyHttps {
+			cookie.Secure = true
+			cookie.SameSite = http.SameSiteNoneMode
+		}
+		if s.MaxAge > 0 {
+			cookie.MaxAge = int(time.Duration(s.MaxAge).Seconds())
+		}
+		http.SetCookie(w, cookie)
 		return upstream
 	}
 
@@ -688,6 +709,7 @@ func (s CookieHashSelection) Select(pool UpstreamPool, req *http.Request, w http
 //
 //	lb_policy cookie [<name> [<secret>]] {
 //		fallback <policy>
+//		max_age <duration>
 //	}
 //
 // By default name is `lb`
@@ -717,6 +739,24 @@ func (s *CookieHashSelection) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return err
 			}
 			s.FallbackRaw = mod
+		case "max_age":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			if s.MaxAge != 0 {
+				return d.Err("cookie max_age already specified")
+			}
+			maxAge, err := caddy.ParseDuration(d.Val())
+			if err != nil {
+				return d.Errf("invalid duration: %s", d.Val())
+			}
+			if maxAge <= 0 {
+				return d.Errf("invalid duration: %s, max_age should be non-zero and positive", d.Val())
+			}
+			if d.NextArg() {
+				return d.ArgErr()
+			}
+			s.MaxAge = caddy.Duration(maxAge)
 		default:
 			return d.Errf("unrecognized option '%s'", d.Val())
 		}
@@ -765,7 +805,7 @@ func leastRequests(upstreams []*Upstream) *Upstream {
 		return nil
 	}
 	var best []*Upstream
-	var bestReqs int = -1
+	bestReqs := -1
 	for _, upstream := range upstreams {
 		if upstream == nil {
 			continue
@@ -797,7 +837,7 @@ func hostByHashing(pool []*Upstream, s string) *Upstream {
 	// see https://medium.com/i0exception/rendezvous-hashing-8c00e2fb58b0,
 	// https://randorithms.com/2020/12/26/rendezvous-hashing.html,
 	// and https://en.wikipedia.org/wiki/Rendezvous_hashing.
-	var highestHash uint32
+	var highestHash uint64
 	var upstream *Upstream
 	for _, up := range pool {
 		if !up.Available() {
@@ -813,10 +853,10 @@ func hostByHashing(pool []*Upstream, s string) *Upstream {
 }
 
 // hash calculates a fast hash based on s.
-func hash(s string) uint32 {
-	h := fnv.New32a()
+func hash(s string) uint64 {
+	h := xxhash.New()
 	_, _ = h.Write([]byte(s))
-	return h.Sum32()
+	return h.Sum64()
 }
 
 func loadFallbackPolicy(d *caddyfile.Dispenser) (json.RawMessage, error) {

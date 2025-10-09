@@ -50,7 +50,7 @@ func Parse(filename string, input []byte) ([]ServerBlock, error) {
 	p := parser{
 		Dispenser: NewDispenser(tokens),
 		importGraph: importGraph{
-			nodes: make(map[string]bool),
+			nodes: make(map[string]struct{}),
 			edges: make(adjacency),
 		},
 	}
@@ -160,13 +160,13 @@ func (p *parser) begin() error {
 	}
 
 	if ok, name := p.isNamedRoute(); ok {
-		// named routes only have one key, the route name
-		p.block.Keys = []string{name}
-		p.block.IsNamedRoute = true
-
 		// we just need a dummy leading token to ease parsing later
 		nameToken := p.Token()
 		nameToken.Text = name
+
+		// named routes only have one key, the route name
+		p.block.Keys = []Token{nameToken}
+		p.block.IsNamedRoute = true
 
 		// get all the tokens from the block, including the braces
 		tokens, err := p.blockTokens(true)
@@ -211,10 +211,16 @@ func (p *parser) addresses() error {
 	var expectingAnother bool
 
 	for {
-		tkn := p.Val()
+		value := p.Val()
+		token := p.Token()
 
-		// special case: import directive replaces tokens during parse-time
-		if tkn == "import" && p.isNewLine() {
+		// Reject request matchers if trying to define them globally
+		if strings.HasPrefix(value, "@") {
+			return p.Errf("request matchers may not be defined globally, they must be in a site block; found %s", value)
+		}
+
+		// Special case: import directive replaces tokens during parse-time
+		if value == "import" && p.isNewLine() {
 			err := p.doImport(0)
 			if err != nil {
 				return err
@@ -223,9 +229,9 @@ func (p *parser) addresses() error {
 		}
 
 		// Open brace definitely indicates end of addresses
-		if tkn == "{" {
+		if value == "{" {
 			if expectingAnother {
-				return p.Errf("Expected another address but had '%s' - check for extra comma", tkn)
+				return p.Errf("Expected another address but had '%s' - check for extra comma", value)
 			}
 			// Mark this server block as being defined with braces.
 			// This is used to provide a better error message when
@@ -237,15 +243,15 @@ func (p *parser) addresses() error {
 		}
 
 		// Users commonly forget to place a space between the address and the '{'
-		if strings.HasSuffix(tkn, "{") {
-			return p.Errf("Site addresses cannot end with a curly brace: '%s' - put a space between the token and the brace", tkn)
+		if strings.HasSuffix(value, "{") {
+			return p.Errf("Site addresses cannot end with a curly brace: '%s' - put a space between the token and the brace", value)
 		}
 
-		if tkn != "" { // empty token possible if user typed ""
+		if value != "" { // empty token possible if user typed ""
 			// Trailing comma indicates another address will follow, which
 			// may possibly be on the next line
-			if tkn[len(tkn)-1] == ',' {
-				tkn = tkn[:len(tkn)-1]
+			if value[len(value)-1] == ',' {
+				value = value[:len(value)-1]
 				expectingAnother = true
 			} else {
 				expectingAnother = false // but we may still see another one on this line
@@ -254,11 +260,17 @@ func (p *parser) addresses() error {
 			// If there's a comma here, it's probably because they didn't use a space
 			// between their two domains, e.g. "foo.com,bar.com", which would not be
 			// parsed as two separate site addresses.
-			if strings.Contains(tkn, ",") {
-				return p.Errf("Site addresses cannot contain a comma ',': '%s' - put a space after the comma to separate site addresses", tkn)
+			if strings.Contains(value, ",") {
+				return p.Errf("Site addresses cannot contain a comma ',': '%s' - put a space after the comma to separate site addresses", value)
 			}
 
-			p.block.Keys = append(p.block.Keys, tkn)
+			// After the above, a comma surrounded by spaces would result
+			// in an empty token which we should ignore
+			if value != "" {
+				// Add the token as a site address
+				token.Text = value
+				p.block.Keys = append(p.block.Keys, token)
+			}
 		}
 
 		// Advance token and possibly break out of loop or return error
@@ -357,9 +369,40 @@ func (p *parser) doImport(nesting int) error {
 	// set up a replacer for non-variadic args replacement
 	repl := makeArgsReplacer(args)
 
+	// grab all the tokens (if it exists) from within a block that follows the import
+	var blockTokens []Token
+	for currentNesting := p.Nesting(); p.NextBlock(currentNesting); {
+		blockTokens = append(blockTokens, p.Token())
+	}
+	// initialize with size 1
+	blockMapping := make(map[string][]Token, 1)
+	if len(blockTokens) > 0 {
+		// use such tokens to create a new dispenser, and then use it to parse each block
+		bd := NewDispenser(blockTokens)
+
+		// one iteration processes one sub-block inside the import
+		for bd.Next() {
+			currentMappingKey := bd.Val()
+
+			if currentMappingKey == "{" {
+				return p.Err("anonymous blocks are not supported")
+			}
+
+			// load up all arguments (if there even are any)
+			currentMappingTokens := bd.RemainingArgsAsTokens()
+
+			// load up the entire block
+			for mappingNesting := bd.Nesting(); bd.NextBlock(mappingNesting); {
+				currentMappingTokens = append(currentMappingTokens, bd.Token())
+			}
+
+			blockMapping[currentMappingKey] = currentMappingTokens
+		}
+	}
+
 	// splice out the import directive and its arguments
 	// (2 tokens, plus the length of args)
-	tokensBefore := p.tokens[:p.cursor-1-len(args)]
+	tokensBefore := p.tokens[:p.cursor-1-len(args)-len(blockTokens)]
 	tokensAfter := p.tokens[p.cursor+1:]
 	var importedTokens []Token
 	var nodes []string
@@ -375,7 +418,7 @@ func (p *parser) doImport(nesting int) error {
 		// make path relative to the file of the _token_ being processed rather
 		// than current working directory (issue #867) and then use glob to get
 		// list of matching filenames
-		absFile, err := filepath.Abs(p.Dispenser.File())
+		absFile, err := caddy.FastAbs(p.Dispenser.File())
 		if err != nil {
 			return p.Errf("Failed to get absolute path of file: %s: %v", p.Dispenser.File(), err)
 		}
@@ -393,7 +436,6 @@ func (p *parser) doImport(nesting int) error {
 			return p.Errf("Glob pattern may only contain one wildcard (*), but has others: %s", globPattern)
 		}
 		matches, err = filepath.Glob(globPattern)
-
 		if err != nil {
 			return p.Errf("Failed to use import pattern %s: %v", importPattern, err)
 		}
@@ -489,6 +531,28 @@ func (p *parser) doImport(nesting int) error {
 				maybeSnippet = false
 			}
 		}
+		// if it is {block}, we substitute with all tokens in the block
+		// if it is {blocks.*}, we substitute with the tokens in the mapping for the *
+		var tokensToAdd []Token
+		foundBlockDirective := false
+		switch {
+		case token.Text == "{block}":
+			foundBlockDirective = true
+			tokensToAdd = blockTokens
+		case strings.HasPrefix(token.Text, "{blocks.") && strings.HasSuffix(token.Text, "}"):
+			foundBlockDirective = true
+			// {blocks.foo.bar} will be extracted to key `foo.bar`
+			blockKey := strings.TrimPrefix(strings.TrimSuffix(token.Text, "}"), "{blocks.")
+			val, ok := blockMapping[blockKey]
+			if ok {
+				tokensToAdd = val
+			}
+		}
+
+		if foundBlockDirective {
+			tokensCopy = append(tokensCopy, tokensToAdd...)
+			continue
+		}
 
 		if maybeSnippet {
 			tokensCopy = append(tokensCopy, token)
@@ -510,7 +574,7 @@ func (p *parser) doImport(nesting int) error {
 	// splice the imported tokens in the place of the import statement
 	// and rewind cursor so Next() will land on first imported token
 	p.tokens = append(tokensBefore, append(tokensCopy, tokensAfter...)...)
-	p.cursor -= len(args) + 1
+	p.cursor -= len(args) + len(blockTokens) + 1
 
 	return nil
 }
@@ -548,7 +612,7 @@ func (p *parser) doSingleImport(importFile string) ([]Token, error) {
 
 	// Tack the file path onto these tokens so errors show the imported file's name
 	// (we use full, absolute path to avoid bugs: issue #1892)
-	filename, err := filepath.Abs(importFile)
+	filename, err := caddy.FastAbs(importFile)
 	if err != nil {
 		return nil, p.Errf("Failed to get absolute path of file: %s: %v", importFile, err)
 	}
@@ -637,8 +701,8 @@ func (p *parser) closeCurlyBrace() error {
 func (p *parser) isNamedRoute() (bool, string) {
 	keys := p.block.Keys
 	// A named route block is a single key with parens, prefixed with &.
-	if len(keys) == 1 && strings.HasPrefix(keys[0], "&(") && strings.HasSuffix(keys[0], ")") {
-		return true, strings.TrimSuffix(keys[0][2:], ")")
+	if len(keys) == 1 && strings.HasPrefix(keys[0].Text, "&(") && strings.HasSuffix(keys[0].Text, ")") {
+		return true, strings.TrimSuffix(keys[0].Text[2:], ")")
 	}
 	return false, ""
 }
@@ -646,8 +710,8 @@ func (p *parser) isNamedRoute() (bool, string) {
 func (p *parser) isSnippet() (bool, string) {
 	keys := p.block.Keys
 	// A snippet block is a single key with parens. Nothing else qualifies.
-	if len(keys) == 1 && strings.HasPrefix(keys[0], "(") && strings.HasSuffix(keys[0], ")") {
-		return true, strings.TrimSuffix(keys[0][1:], ")")
+	if len(keys) == 1 && strings.HasPrefix(keys[0].Text, "(") && strings.HasSuffix(keys[0].Text, ")") {
+		return true, strings.TrimSuffix(keys[0].Text[1:], ")")
 	}
 	return false, ""
 }
@@ -691,9 +755,17 @@ func (p *parser) blockTokens(retainCurlies bool) ([]Token, error) {
 // grouped by segments.
 type ServerBlock struct {
 	HasBraces    bool
-	Keys         []string
+	Keys         []Token
 	Segments     []Segment
 	IsNamedRoute bool
+}
+
+func (sb ServerBlock) GetKeysText() []string {
+	res := []string{}
+	for _, k := range sb.Keys {
+		res = append(res, k.Text)
+	}
+	return res
 }
 
 // DispenseDirective returns a dispenser that contains

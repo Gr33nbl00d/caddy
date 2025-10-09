@@ -20,6 +20,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +28,8 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"golang.org/x/term"
+
+	"github.com/caddyserver/caddy/v2/internal"
 )
 
 func init() {
@@ -161,7 +164,9 @@ func (logging *Logging) setupNewDefault(ctx Context) error {
 	if err != nil {
 		return fmt.Errorf("setting up default log: %v", err)
 	}
-	newDefault.logger = zap.New(newDefault.CustomLog.core, options...)
+
+	filteringCore := &filteringCore{newDefault.CustomLog.core, newDefault.CustomLog}
+	newDefault.logger = zap.New(filteringCore, options...)
 
 	// redirect the default caddy logs
 	defaultLoggerMu.Lock()
@@ -185,6 +190,13 @@ func (logging *Logging) setupNewDefault(ctx Context) error {
 			zap.String("from", currentDefaultLogWriterStr),
 			zap.String("to", newDefaultLogWriterStr),
 		)
+	}
+
+	// if we had a buffered core, flush its contents ASAP
+	// before we try to log anything else, so the order of
+	// logs is preserved
+	if oldBufferCore, ok := oldDefault.logger.Core().(*internal.LogBufferCore); ok {
+		oldBufferCore.FlushTo(newDefault.logger)
 	}
 
 	return nil
@@ -292,6 +304,10 @@ type BaseLog struct {
 	// The encoder is how the log entries are formatted or encoded.
 	EncoderRaw json.RawMessage `json:"encoder,omitempty" caddy:"namespace=caddy.logging.encoders inline_key=format"`
 
+	// Tees entries through a zap.Core module which can extract
+	// log entry metadata and fields for further processing.
+	CoreRaw json.RawMessage `json:"core,omitempty" caddy:"namespace=caddy.logging.cores inline_key=module"`
+
 	// Level is the minimum level to emit, and is inclusive.
 	// Possible levels: DEBUG, INFO, WARN, ERROR, PANIC, and FATAL
 	Level string `json:"level,omitempty"`
@@ -366,13 +382,21 @@ func (cl *BaseLog) provisionCommon(ctx Context, logging *Logging) error {
 		cl.encoder = newDefaultProductionLogEncoder(cl.writerOpener)
 	}
 	cl.buildCore()
+	if cl.CoreRaw != nil {
+		mod, err := ctx.LoadModule(cl, "CoreRaw")
+		if err != nil {
+			return fmt.Errorf("loading log core module: %v", err)
+		}
+		core := mod.(zapcore.Core)
+		cl.core = zapcore.NewTee(cl.core, core)
+	}
 	return nil
 }
 
 func (cl *BaseLog) buildCore() {
 	// logs which only discard their output don't need
 	// to perform encoding or any other processing steps
-	// at all, so just shorcut to a nop core instead
+	// at all, so just shortcut to a nop core instead
 	if _, ok := cl.writerOpener.(*DiscardWriter); ok {
 		cl.core = zapcore.NewNopCore()
 		return
@@ -478,10 +502,8 @@ func (cl *CustomLog) provision(ctx Context, logging *Logging) error {
 	if len(cl.Include) > 0 && len(cl.Exclude) > 0 {
 		// prevent intersections
 		for _, allow := range cl.Include {
-			for _, deny := range cl.Exclude {
-				if allow == deny {
-					return fmt.Errorf("include and exclude must not intersect, but found %s in both lists", allow)
-				}
+			if slices.Contains(cl.Exclude, allow) {
+				return fmt.Errorf("include and exclude must not intersect, but found %s in both lists", allow)
 			}
 		}
 
@@ -758,6 +780,21 @@ func Log() *zap.Logger {
 	defaultLoggerMu.RLock()
 	defer defaultLoggerMu.RUnlock()
 	return defaultLogger.logger
+}
+
+// BufferedLog sets the default logger to one that buffers
+// logs before a config is loaded.
+// Returns the buffered logger, the original default logger
+// (for flushing on errors), and the buffer core so that the
+// caller can flush the logs after the config is loaded or
+// fails to load.
+func BufferedLog() (*zap.Logger, *zap.Logger, *internal.LogBufferCore) {
+	defaultLoggerMu.Lock()
+	defer defaultLoggerMu.Unlock()
+	origLogger := defaultLogger.logger
+	bufferCore := internal.NewLogBufferCore(zap.InfoLevel)
+	defaultLogger.logger = zap.New(bufferCore)
+	return defaultLogger.logger, origLogger, bufferCore
 }
 
 var (

@@ -13,9 +13,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/caddyserver/caddy/v2/caddytest"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
+
+	"github.com/caddyserver/caddy/v2/caddytest"
 )
 
 // (see https://github.com/caddyserver/caddy/issues/3556 for use case)
@@ -334,7 +335,7 @@ func TestH2ToH1ChunkedResponse(t *testing.T) {
 		ProtoMinor: 0,
 		Header:     make(http.Header),
 	}
-	// underlying transport will automaticlly add gzip
+	// underlying transport will automatically add gzip
 	// req.Header.Set("Accept-Encoding", "gzip")
 	go func() {
 		fmt.Fprint(w, expectedBody)

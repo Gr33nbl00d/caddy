@@ -22,19 +22,25 @@ import (
 )
 
 func init() {
-	httpcaddyfile.RegisterHandlerDirective("basicauth", parseCaddyfile)
+	httpcaddyfile.RegisterHandlerDirective("basicauth", parseCaddyfile) // deprecated
+	httpcaddyfile.RegisterHandlerDirective("basic_auth", parseCaddyfile)
 }
 
 // parseCaddyfile sets up the handler from Caddyfile tokens. Syntax:
 //
-//	basicauth [<matcher>] [<hash_algorithm> [<realm>]] {
-//	    <username> <hashed_password_base64> [<salt_base64>]
+//	basic_auth [<matcher>] [<hash_algorithm> [<realm>]] {
+//	    <username> <hashed_password>
 //	    ...
 //	}
 //
 // If no hash algorithm is supplied, bcrypt will be assumed.
 func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
 	h.Next() // consume directive name
+
+	// "basicauth" is deprecated, replaced by "basic_auth"
+	if h.Val() == "basicauth" {
+		caddy.Log().Named("config.adapter.caddyfile").Warn("the 'basicauth' directive is deprecated, please use 'basic_auth' instead!")
+	}
 
 	var ba HTTPBasicAuth
 	ba.HashCache = new(Cache)
@@ -45,7 +51,7 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 	var hashName string
 	switch len(args) {
 	case 0:
-		hashName = "bcrypt"
+		hashName = bcryptName
 	case 1:
 		hashName = args[0]
 	case 2:
@@ -56,10 +62,10 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 	}
 
 	switch hashName {
-	case "bcrypt":
+	case bcryptName:
 		cmp = BcryptHash{}
-	case "scrypt":
-		cmp = ScryptHash{}
+	case argon2idName:
+		cmp = Argon2idHash{}
 	default:
 		return nil, h.Errf("unrecognized hash algorithm: %s", hashName)
 	}
@@ -69,8 +75,8 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 	for h.NextBlock(0) {
 		username := h.Val()
 
-		var b64Pwd, b64Salt string
-		h.Args(&b64Pwd, &b64Salt)
+		var b64Pwd string
+		h.Args(&b64Pwd)
 		if h.NextArg() {
 			return nil, h.ArgErr()
 		}
@@ -82,7 +88,6 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 		ba.AccountList = append(ba.AccountList, Account{
 			Username: username,
 			Password: b64Pwd,
-			Salt:     b64Salt,
 		})
 	}
 
