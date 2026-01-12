@@ -51,6 +51,7 @@ func init() {
 // Placeholder | Description
 // ------------|---------------
 // `{http.request.body}` | The request body (⚠️ inefficient; use only for debugging)
+// `{http.request.body_base64}` | The request body, base64-encoded (⚠️ for debugging)
 // `{http.request.cookie.*}` | HTTP request cookie
 // `{http.request.duration}` | Time up to now spent handling the request (after decoding headers from client)
 // `{http.request.duration_ms}` | Same as 'duration', but in milliseconds.
@@ -82,6 +83,7 @@ func init() {
 // `{http.request.tls.proto}` | The negotiated next protocol
 // `{http.request.tls.proto_mutual}` | The negotiated next protocol was advertised by the server
 // `{http.request.tls.server_name}` | The server name requested by the client, if any
+// `{http.request.tls.ech}` | Whether ECH was offered by the client and accepted by the server
 // `{http.request.tls.client.fingerprint}` | The SHA256 checksum of the client certificate
 // `{http.request.tls.client.public_key}` | The public key of the client certificate.
 // `{http.request.tls.client.public_key_sha256}` | The SHA256 checksum of the client's public key.
@@ -198,6 +200,8 @@ func (app *App) Provision(ctx caddy.Context) error {
 	if app.Metrics != nil {
 		app.Metrics.init = sync.Once{}
 		app.Metrics.httpMetrics = &httpMetrics{}
+		// Scan config for allowed hosts to prevent cardinality explosion
+		app.Metrics.scanConfigForHosts(app)
 	}
 	// prepare each server
 	oldContext := ctx.Context
@@ -344,6 +348,20 @@ func (app *App) Provision(ctx caddy.Context) error {
 				srv.listenerWrappers = append([]caddy.ListenerWrapper{new(tlsPlaceholderWrapper)}, srv.listenerWrappers...)
 			}
 		}
+
+		// set up each packet conn modifier
+		if srv.PacketConnWrappersRaw != nil {
+			vals, err := ctx.LoadModule(srv, "PacketConnWrappersRaw")
+			if err != nil {
+				return fmt.Errorf("loading packet conn wrapper modules: %v", err)
+			}
+			// if any wrappers were configured, they come before the QUIC handshake;
+			// unlike TLS above, there is no QUIC placeholder
+			for _, val := range vals.([]any) {
+				srv.packetConnWrappers = append(srv.packetConnWrappers, val.(caddy.PacketConnWrapper))
+			}
+		}
+
 		// pre-compile the primary handler chain, and be sure to wrap it in our
 		// route handler so that important security checks are done, etc.
 		primaryRoute := emptyHandler
@@ -466,7 +484,14 @@ func (app *App) Start() error {
 			ErrorLog:          serverLogger,
 			Protocols:         new(http.Protocols),
 			ConnContext: func(ctx context.Context, c net.Conn) context.Context {
-				return context.WithValue(ctx, ConnCtxKey, c)
+				if nc, ok := c.(interface{ tlsNetConn() net.Conn }); ok {
+					getTlsConStateFunc := sync.OnceValue(func() *tls.ConnectionState {
+						tlsConnState := nc.tlsNetConn().(connectionStater).ConnectionState()
+						return &tlsConnState
+					})
+					ctx = context.WithValue(ctx, tlsConnectionStateFuncCtxKey, getTlsConStateFunc)
+				}
+				return ctx
 			},
 		}
 
@@ -538,6 +563,8 @@ func (app *App) Start() error {
 						KeepAliveConfig: net.KeepAliveConfig{
 							Enable:   srv.KeepAliveInterval >= 0,
 							Interval: time.Duration(srv.KeepAliveInterval),
+							Idle:     time.Duration(srv.KeepAliveIdle),
+							Count:    srv.KeepAliveCount,
 						},
 					})
 					if err != nil {
